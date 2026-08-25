@@ -62,6 +62,7 @@ function connectToRoom(room) {
       return;
     }
 
+    showStatus("");
     disconnectActions.classList.remove("hidden");
     rejoinButton.textContent = `Rejoin Room ${room.roomCode}`;
   });
