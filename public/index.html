@@ -1,15 +1,53 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>In A Pickle</title>
   <style>
-    body { font-family: sans-serif; display: grid; place-items: center; height: 100vh; background: #dff5d8; }
+    :root { font-family: system-ui, sans-serif; color: #17351c; background: #dff5d8; }
+    body { display: grid; place-items: center; min-height: 100vh; margin: 0; }
+    main { width: min(420px, calc(100% - 32px)); padding: 32px; background: #fffef5; border: 3px solid #17351c; border-radius: 20px; box-shadow: 8px 8px 0 #17351c; }
+    h1 { margin-top: 0; font-size: 2.5rem; }
+    form { display: grid; gap: 10px; margin: 20px 0; }
+    input, button { box-sizing: border-box; width: 100%; padding: 12px; font: inherit; border: 2px solid #17351c; border-radius: 8px; }
+    button { cursor: pointer; background: #a7d96b; font-weight: 700; }
+    button:hover { background: #8fc653; }
+    .room { padding: 16px; background: #edf8df; border-radius: 10px; }
+    #room-code { font-size: 1.8rem; letter-spacing: .15em; }
+    #status { min-height: 1.5em; }
+    ul { padding-left: 20px; }
+    .hidden { display: none; }
   </style>
 </head>
 <body>
-  <div style="text-align:center">
+  <main>
     <h1>🥒 In A Pickle</h1>
     <p>Scream your way to the jar.</p>
-  </div>
+
+    <section id="entry">
+      <form id="create-form">
+        <h2>Create a room</h2>
+        <input id="create-name" maxlength="24" placeholder="Your name" required>
+        <button type="submit">Create Room</button>
+      </form>
+
+      <form id="join-form">
+        <h2>Join a room</h2>
+        <input id="join-name" maxlength="24" placeholder="Your name" required>
+        <input id="join-code" maxlength="4" placeholder="Room code" required>
+        <button type="submit">Join Room</button>
+      </form>
+    </section>
+
+    <section id="lobby" class="hidden">
+      <div class="room">Room code: <strong id="room-code"></strong></div>
+      <h2>Players</h2>
+      <ul id="players"></ul>
+    </section>
+
+    <p id="status"></p>
+  </main>
+  <script src="/app.js"></script>
 </body>
 </html>
