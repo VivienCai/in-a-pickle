@@ -21,6 +21,7 @@
 
             main {
                 width: min(430px, calc(100% - 32px));
+                box-sizing: border-box;
                 position: relative;
                 padding: 34px 32px 28px;
                 background: #fff8df;
@@ -33,8 +34,9 @@
                 color: #4b842f;
                 font-size: clamp(2.4rem, 11vw, 3.4rem);
                 line-height: 0.88;
-                letter-spacing: -0.08em;
+                letter-spacing: -0.03em;
                 text-transform: uppercase;
+                white-space: nowrap;
             }
 
             h2 {
@@ -46,7 +48,7 @@
             }
 
             p {
-                max-width: 265px;
+                margin: 10px 0;
                 font-weight: 700;
                 color: #526141;
             }
@@ -122,6 +124,12 @@
                 border-bottom: 1px solid #c5d79a;
                 font-weight: 800;
             }
+            .player-row.speaking {
+                padding-left: 8px;
+                color: #315f25;
+                background: #e7f3cf;
+                border-left: 4px solid #4b842f;
+            }
             .mic-status {
                 flex-shrink: 0;
                 padding: 3px 6px;
@@ -164,6 +172,21 @@
             #start-button {
                 margin-top: 10px;
             }
+            .mic-setup {
+                margin-top: 18px;
+                padding: 14px;
+                background: #f2f5df;
+                border: 1px solid #c5d79a;
+                border-radius: 5px;
+            }
+            .setup-label {
+                margin-bottom: 8px;
+                color: #526141;
+                font-size: 0.75rem;
+                font-weight: 900;
+                letter-spacing: 0.08em;
+                text-transform: uppercase;
+            }
             #game {
                 width: 100%;
             }
@@ -191,9 +214,48 @@
                 gap: 8px;
                 min-width: min(300px, 45%);
             }
+            .voice-bar {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin-bottom: 12px;
+            }
+            .voice-pill {
+                padding: 6px 10px;
+                color: #526141;
+                background: #f2f5df;
+                border: 2px solid #9aae78;
+                border-radius: 999px;
+                font-size: 0.8rem;
+                font-weight: 900;
+                transition:
+                    transform 100ms ease,
+                    background 100ms ease;
+            }
+            .voice-pill.speaking {
+                color: #fff8df;
+                background: #4b842f;
+                border-color: #1f3020;
+                transform: scale(1.04);
+            }
+            .voice-connection {
+                margin: 10px 0 0;
+                color: #526141;
+                font-size: 0.78rem;
+                font-weight: 900;
+                text-transform: uppercase;
+            }
             #volume-meter {
                 width: 100%;
                 accent-color: #4b842f;
+            }
+            #calibrate-button {
+                margin-top: 10px;
+                background: #f0bd3d;
+            }
+            #calibration-instructions {
+                margin: 10px 0 0;
+                font-size: 0.9rem;
             }
             #start-button:disabled {
                 cursor: not-allowed;
@@ -257,14 +319,25 @@
                 <div class="room">
                     Room code: <strong id="room-code"></strong>
                 </div>
+                <div id="voice-status" class="voice-connection">
+                    Voice: connecting
+                </div>
                 <h2>Players</h2>
                 <ul id="players"></ul>
                 <button id="start-button" class="hidden" type="button">
                     Start Run
                 </button>
-                <button id="mic-button" type="button">Enable Microphone</button>
-                <div id="mic-status" class="mic-status-banner hidden">
-                    Microphone ready
+                <div class="mic-setup">
+                    <div class="setup-label">Asking for microphone permission...</div>
+                    <div id="mic-status" class="mic-status-banner hidden">
+                        Microphone ready
+                    </div>
+                    <button id="calibrate-button" class="hidden" type="button">
+                        Calibrate Microphone
+                    </button>
+                    <p id="calibration-instructions" class="hidden">
+                        Stay quiet, then make your loudest noise.
+                    </p>
                 </div>
                 <div id="disconnect-actions" class="hidden">
                     <p>You disconnected from this room.</p>
@@ -278,19 +351,27 @@
             </section>
 
             <section id="game" class="hidden">
+                <div id="voice-bar" class="voice-bar"></div>
                 <div class="game-hud">
                     <span>Score: <strong id="score">0</strong></span>
-                    <span>Average volume: <progress id="volume-meter" max="1" value="0"></progress></span>
+                    <span
+                        >Average volume:
+                        <progress id="volume-meter" max="1" value="0"></progress
+                    ></span>
                 </div>
                 <canvas id="game-canvas" width="900" height="420"></canvas>
                 <button id="restart-button" class="hidden" type="button">
                     Restart Run
                 </button>
-                <p id="game-message">Use your voice to steer the pickle. Avoid the obstacles and ceiling spikes.</p>
+                <p id="game-message">
+                    Use your voice to steer the pickle. Avoid the obstacles and
+                    ceiling spikes.
+                </p>
             </section>
 
             <p id="status"></p>
         </main>
+        <script src="https://cdn.jsdelivr.net/npm/@cloudflare/realtimekit@latest/dist/browser.js"></script>
         <script src="/app.js"></script>
     </body>
 </html>

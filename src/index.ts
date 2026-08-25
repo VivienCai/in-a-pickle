@@ -3,6 +3,10 @@ export { GameRoom } from "./gameRoom";
 export interface Env {
   GAME_ROOMS: DurableObjectNamespace;
   ASSETS: Fetcher;
+  CLOUDFLARE_ACCOUNT_ID: string;
+  REALTIMEKIT_APP_ID: string;
+  REALTIMEKIT_PRESET_NAME: string;
+  CLOUDFLARE_API_TOKEN: string;
 }
 
 const ROOM_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -67,7 +71,7 @@ export default {
       return errorResponse("Could not create a unique room. Try again.", 500);
     }
 
-    const roomMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)(?:\/(join|state))?$/);
+    const roomMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)(?:\/(join|state|voice))?$/);
     if (roomMatch) {
       const roomCode = roomMatch[1].toUpperCase();
       const action = roomMatch[2];
@@ -94,6 +98,18 @@ export default {
 
       if (action === "state" && request.method === "GET") {
         return room.fetch(new Request("https://room.internal/internal/state"));
+      }
+
+      if (action === "voice" && request.method === "GET") {
+        const playerId = url.searchParams.get("playerId");
+        if (!playerId) {
+          return errorResponse("playerId is required.");
+        }
+
+        const internalUrl = new URL("https://room.internal/internal/voice");
+        internalUrl.searchParams.set("roomCode", roomCode);
+        internalUrl.searchParams.set("playerId", playerId);
+        return room.fetch(new Request(internalUrl));
       }
     }
 

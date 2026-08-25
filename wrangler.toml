@@ -2,6 +2,11 @@ name = "in-a-pickle"
 main = "src/index.ts"
 compatibility_date = "2025-05-01"
 
+[vars]
+CLOUDFLARE_ACCOUNT_ID = "0f8e8a0bcbe9713b1227d70488e1a9d8"
+REALTIMEKIT_APP_ID = "96ae0a35-db30-4104-b896-2973b8fd7594"
+REALTIMEKIT_PRESET_NAME = "audio_only_participant"
+
 [assets]
 directory = "./public"
 binding = "ASSETS"

@@ -5,6 +5,7 @@ export interface Player {
   name: string;
   isHost: boolean;
   micReady: boolean;
+  speaking: boolean;
 }
 
 export interface RoomState {
@@ -40,6 +41,7 @@ export type ClientMessage =
   | { type: "startGame" }
   | { type: "restartGame" }
   | { type: "micReady" }
+  | { type: "micNotReady" }
   | { type: "reportVolume"; volume: number };
 
 export type ServerMessage =

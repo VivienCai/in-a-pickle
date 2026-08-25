@@ -1,4 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
+import { addParticipant, createMeeting } from "./realtimeKit";
 import type {
   ClientMessage,
   LiveGameState,
@@ -11,6 +12,10 @@ import type {
 interface Env {
   GAME_ROOMS: DurableObjectNamespace;
   ASSETS: Fetcher;
+  CLOUDFLARE_ACCOUNT_ID: string;
+  REALTIMEKIT_APP_ID: string;
+  REALTIMEKIT_PRESET_NAME: string;
+  CLOUDFLARE_API_TOKEN: string;
 }
 
 interface StoredPlayer {
@@ -27,19 +32,25 @@ interface RoomRow {
   status: RoomState["status"];
 }
 
+interface MeetingRow {
+  meeting_id: string | null;
+}
+
 const RECONNECT_GRACE_MS = 5 * 60 * 1000;
 const TICK_MS = 50;
 const RUN_SPEED = 180;
 const WORLD_HEIGHT = 350;
 const PICKLE_HEIGHT = 48;
 const CEILING_SPIKE_HEIGHT = 60;
+const SPEAKING_VOLUME_THRESHOLD = 0.15;
 
-export class GameRoom extends DurableObject {
+export class GameRoom extends DurableObject<Env> {
   private readonly sockets = new Map<WebSocket, string>();
   private readonly micReady = new Set<string>();
   private readonly playerVolumes = new Map<string, { volume: number; lastReportedAt: number }>();
   private game: LiveGameState | null = null;
   private gameLoop: ReturnType<typeof setInterval> | null = null;
+  private lastLobbyVoiceBroadcastAt = 0;
   private randomState = 1;
   private nextObstacleX = 500;
   private nextObstacleId = 1;
@@ -66,6 +77,7 @@ export class GameRoom extends DurableObject {
     `);
     this.ensurePlayerColumn("connected", "INTEGER NOT NULL DEFAULT 0");
     this.ensurePlayerColumn("last_seen_at", "INTEGER NOT NULL DEFAULT 0");
+    this.ensureRoomColumn("meeting_id", "TEXT");
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -86,6 +98,10 @@ export class GameRoom extends DurableObject {
       }
 
       return Response.json(state);
+    }
+
+    if (url.pathname === "/internal/voice" && request.method === "GET") {
+      return this.createVoiceToken(request);
     }
 
     if (url.pathname === "/ws" && request.headers.get("Upgrade") === "websocket") {
@@ -111,7 +127,13 @@ export class GameRoom extends DurableObject {
 
     const now = Date.now();
     const playerId = crypto.randomUUID();
-    this.ctx.storage.sql.exec("INSERT INTO rooms (code, status, created_at) VALUES (?, 'lobby', ?)", roomCode, now);
+    const meetingId = await createMeeting(this.env, roomCode);
+    this.ctx.storage.sql.exec(
+      "INSERT INTO rooms (code, status, created_at, meeting_id) VALUES (?, 'lobby', ?, ?)",
+      roomCode,
+      now,
+      meetingId,
+    );
     this.ctx.storage.sql.exec(
       "INSERT INTO players (id, room_code, name, is_host, joined_at) VALUES (?, ?, ?, 1, ?)",
       playerId,
@@ -202,6 +224,8 @@ export class GameRoom extends DurableObject {
         this.restartGame(socket);
       } else if (message.type === "micReady") {
         this.markMicReady(socket);
+      } else if (message.type === "micNotReady") {
+        this.clearMicReady(socket);
       } else if (message.type === "reportVolume") {
         this.reportVolume(socket, message.volume);
       }
@@ -213,6 +237,7 @@ export class GameRoom extends DurableObject {
   private getState(): RoomState {
     const roomRows = this.ctx.storage.sql.exec("SELECT code, status FROM rooms LIMIT 1").toArray() as unknown as RoomRow[];
     const playerRows = this.ctx.storage.sql.exec("SELECT id, name, is_host, connected, last_seen_at FROM players WHERE connected = 1 ORDER BY joined_at").toArray() as unknown as StoredPlayer[];
+    const now = Date.now();
 
     return {
       roomCode: roomRows[0]?.code ?? "",
@@ -222,8 +247,38 @@ export class GameRoom extends DurableObject {
         name: player.name,
         isHost: player.is_host === 1,
         micReady: this.micReady.has(player.id),
+        speaking: this.isSpeaking(player.id, now),
       })),
     };
+  }
+
+  private async createVoiceToken(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const roomCode = url.searchParams.get("roomCode")?.toUpperCase();
+    const playerId = url.searchParams.get("playerId");
+
+    if (!roomCode || !playerId || !this.playerExists(roomCode, playerId)) {
+      return Response.json({ error: "Invalid room or player." }, { status: 401 });
+    }
+
+    const meetingRows = this.ctx.storage.sql
+      .exec("SELECT meeting_id FROM rooms WHERE code = ?", roomCode)
+      .toArray() as unknown as MeetingRow[];
+    const meetingId = meetingRows[0]?.meeting_id;
+    if (!meetingId) {
+      return Response.json({ voiceToken: null });
+    }
+
+    const playerRows = this.ctx.storage.sql
+      .exec("SELECT name FROM players WHERE id = ? AND room_code = ?", playerId, roomCode)
+      .toArray() as unknown as Array<{ name: string }>;
+    const name = playerRows[0]?.name;
+    if (!name) {
+      return Response.json({ error: "Player does not exist." }, { status: 404 });
+    }
+
+    const voiceToken = await addParticipant(this.env, meetingId, playerId, name);
+    return Response.json({ voiceToken });
   }
 
   private playerExists(roomCode: string, playerId: string): boolean {
@@ -267,6 +322,22 @@ export class GameRoom extends DurableObject {
     if (!columns.some((column) => column.name === name)) {
       this.ctx.storage.sql.exec(`ALTER TABLE players ADD COLUMN ${name} ${definition}`);
     }
+  }
+
+  private ensureRoomColumn(name: string, definition: string): void {
+    const columns = this.ctx.storage.sql.exec("PRAGMA table_info(rooms)").toArray() as unknown as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === name)) {
+      this.ctx.storage.sql.exec(`ALTER TABLE rooms ADD COLUMN ${name} ${definition}`);
+    }
+  }
+
+  private isSpeaking(playerId: string, now: number): boolean {
+    const report = this.playerVolumes.get(playerId);
+    return Boolean(
+      report &&
+      now - report.lastReportedAt <= 500 &&
+      report.volume >= SPEAKING_VOLUME_THRESHOLD
+    );
   }
 
   private activePlayerCount(): number {
@@ -322,17 +393,6 @@ export class GameRoom extends DurableObject {
       return;
     }
 
-    const missingMicrophones = room.players.filter(
-      (player) => !this.micReady.has(player.id),
-    );
-    if (missingMicrophones.length > 0) {
-      this.send(socket, {
-        type: "error",
-        message: "Everyone must enable their microphone before starting.",
-      });
-      return;
-    }
-
     const seedBytes = new Uint32Array(1);
     crypto.getRandomValues(seedBytes);
     this.beginGame(seedBytes[0] || 1);
@@ -384,10 +444,16 @@ export class GameRoom extends DurableObject {
       return;
     }
 
+    const now = Date.now();
     this.playerVolumes.set(playerId, {
       volume: Math.max(0, Math.min(1, volume)),
-      lastReportedAt: Date.now(),
+      lastReportedAt: now,
     });
+
+    if (!this.game && now - this.lastLobbyVoiceBroadcastAt >= 100) {
+      this.lastLobbyVoiceBroadcastAt = now;
+      this.broadcastState();
+    }
   }
 
   private markMicReady(socket: WebSocket): void {
@@ -397,6 +463,16 @@ export class GameRoom extends DurableObject {
     }
 
     this.micReady.add(playerId);
+    this.broadcastState();
+  }
+
+  private clearMicReady(socket: WebSocket): void {
+    const playerId = this.sockets.get(socket);
+    if (!playerId) {
+      return;
+    }
+
+    this.micReady.delete(playerId);
     this.broadcastState();
   }
 
