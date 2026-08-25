@@ -113,6 +113,30 @@
             ul {
                 padding-left: 20px;
             }
+            .player-row {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+                padding: 9px 0;
+                border-bottom: 1px solid #c5d79a;
+                font-weight: 800;
+            }
+            .mic-status {
+                flex-shrink: 0;
+                padding: 3px 6px;
+                border-radius: 3px;
+                font-size: 0.68rem;
+                letter-spacing: 0.04em;
+            }
+            .mic-status.ready {
+                color: #fff8df;
+                background: #4b842f;
+            }
+            .mic-status.waiting {
+                color: #fff8df;
+                background: #d8523b;
+            }
             .hidden {
                 display: none;
             }
@@ -136,6 +160,53 @@
             #rejoin-prompt button + button {
                 margin-top: 10px;
                 background: #f0bd3d;
+            }
+            #start-button {
+                margin-top: 10px;
+            }
+            #game {
+                width: 100%;
+            }
+            body.in-game main {
+                width: min(960px, calc(100% - 32px));
+            }
+            #game-canvas {
+                display: block;
+                width: 100%;
+                height: auto;
+                margin-top: 16px;
+                background: #fff8df;
+                border: 3px solid #1f3020;
+                border-radius: 6px;
+            }
+            .game-hud {
+                display: flex;
+                justify-content: space-between;
+                gap: 12px;
+                font-weight: 900;
+            }
+            .game-hud span:last-child {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                min-width: min(300px, 45%);
+            }
+            #volume-meter {
+                width: 100%;
+                accent-color: #4b842f;
+            }
+            #start-button:disabled {
+                cursor: not-allowed;
+                opacity: 0.6;
+            }
+            .mic-status-banner {
+                margin: 12px 0;
+                padding: 10px 12px;
+                color: #fff8df;
+                background: #4b842f;
+                border-radius: 5px;
+                font-weight: 900;
+                text-align: center;
             }
         </style>
     </head>
@@ -188,6 +259,13 @@
                 </div>
                 <h2>Players</h2>
                 <ul id="players"></ul>
+                <button id="start-button" class="hidden" type="button">
+                    Start Run
+                </button>
+                <button id="mic-button" type="button">Enable Microphone</button>
+                <div id="mic-status" class="mic-status-banner hidden">
+                    Microphone ready
+                </div>
                 <div id="disconnect-actions" class="hidden">
                     <p>You disconnected from this room.</p>
                     <button id="rejoin-button" type="button">
@@ -197,6 +275,18 @@
                         Join a New Room
                     </button>
                 </div>
+            </section>
+
+            <section id="game" class="hidden">
+                <div class="game-hud">
+                    <span>Score: <strong id="score">0</strong></span>
+                    <span>Average volume: <progress id="volume-meter" max="1" value="0"></progress></span>
+                </div>
+                <canvas id="game-canvas" width="900" height="420"></canvas>
+                <button id="restart-button" class="hidden" type="button">
+                    Restart Run
+                </button>
+                <p id="game-message">Use your voice to steer the pickle. Avoid the obstacles and ceiling spikes.</p>
             </section>
 
             <p id="status"></p>

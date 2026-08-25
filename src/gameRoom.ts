@@ -1,5 +1,12 @@
 import { DurableObject } from "cloudflare:workers";
-import type { ClientMessage, Player, RoomState, ServerMessage } from "./types";
+import type {
+  ClientMessage,
+  LiveGameState,
+  Obstacle,
+  Player,
+  RoomState,
+  ServerMessage,
+} from "./types";
 
 interface Env {
   GAME_ROOMS: DurableObjectNamespace;
@@ -21,9 +28,21 @@ interface RoomRow {
 }
 
 const RECONNECT_GRACE_MS = 5 * 60 * 1000;
+const TICK_MS = 50;
+const RUN_SPEED = 180;
+const WORLD_HEIGHT = 350;
+const PICKLE_HEIGHT = 48;
+const CEILING_SPIKE_HEIGHT = 60;
 
 export class GameRoom extends DurableObject {
   private readonly sockets = new Map<WebSocket, string>();
+  private readonly micReady = new Set<string>();
+  private readonly playerVolumes = new Map<string, { volume: number; lastReportedAt: number }>();
+  private game: LiveGameState | null = null;
+  private gameLoop: ReturnType<typeof setInterval> | null = null;
+  private randomState = 1;
+  private nextObstacleX = 500;
+  private nextObstacleId = 1;
 
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
@@ -177,6 +196,14 @@ export class GameRoom extends DurableObject {
         this.send(socket, { type: "pong" });
       } else if (message.type === "getState") {
         this.sendState(socket);
+      } else if (message.type === "startGame") {
+        this.startGame(socket);
+      } else if (message.type === "restartGame") {
+        this.restartGame(socket);
+      } else if (message.type === "micReady") {
+        this.markMicReady(socket);
+      } else if (message.type === "reportVolume") {
+        this.reportVolume(socket, message.volume);
       }
     } catch {
       this.send(socket, { type: "error", message: "Invalid WebSocket message." });
@@ -194,6 +221,7 @@ export class GameRoom extends DurableObject {
         id: player.id,
         name: player.name,
         isHost: player.is_host === 1,
+        micReady: this.micReady.has(player.id),
       })),
     };
   }
@@ -204,7 +232,7 @@ export class GameRoom extends DurableObject {
   }
 
   private sendState(socket: WebSocket): void {
-    this.send(socket, { type: "state", state: this.getState() });
+    this.send(socket, { type: "state", state: this.getState(), game: this.game });
   }
 
   private broadcastState(): void {
@@ -247,6 +275,11 @@ export class GameRoom extends DurableObject {
   }
 
   private closeRoom(): void {
+    if (this.gameLoop) {
+      clearInterval(this.gameLoop);
+      this.gameLoop = null;
+    }
+    this.game = null;
     this.ctx.storage.sql.exec("DELETE FROM players");
     this.ctx.storage.sql.exec("DELETE FROM rooms");
     this.ctx.storage.deleteAlarm();
@@ -259,6 +292,7 @@ export class GameRoom extends DurableObject {
     }
 
     this.sockets.delete(socket);
+    this.micReady.delete(playerId);
     this.ctx.storage.sql.exec(
       "UPDATE players SET connected = 0, last_seen_at = ? WHERE id = ?",
       Date.now(),
@@ -273,6 +307,212 @@ export class GameRoom extends DurableObject {
 
     this.ctx.storage.setAlarm(Date.now() + RECONNECT_GRACE_MS);
     this.broadcastState();
+  }
+
+  private startGame(socket: WebSocket): void {
+    const playerId = this.sockets.get(socket);
+    if (!playerId || !this.isHost(playerId)) {
+      this.send(socket, { type: "error", message: "Only the host can start the game." });
+      return;
+    }
+
+    const room = this.getState();
+    if (room.status !== "lobby") {
+      this.send(socket, { type: "error", message: "This game has already started." });
+      return;
+    }
+
+    const missingMicrophones = room.players.filter(
+      (player) => !this.micReady.has(player.id),
+    );
+    if (missingMicrophones.length > 0) {
+      this.send(socket, {
+        type: "error",
+        message: "Everyone must enable their microphone before starting.",
+      });
+      return;
+    }
+
+    const seedBytes = new Uint32Array(1);
+    crypto.getRandomValues(seedBytes);
+    this.beginGame(seedBytes[0] || 1);
+  }
+
+  private restartGame(socket: WebSocket): void {
+    const playerId = this.sockets.get(socket);
+    if (!playerId || !this.isHost(playerId)) {
+      this.send(socket, { type: "error", message: "Only the host can restart the game." });
+      return;
+    }
+
+    const room = this.getState();
+    if (room.status !== "finished") {
+      this.send(socket, { type: "error", message: "The game is still running." });
+      return;
+    }
+
+    const seedBytes = new Uint32Array(1);
+    crypto.getRandomValues(seedBytes);
+    this.beginGame(seedBytes[0] || 1);
+  }
+
+  private beginGame(seed: number): void {
+    this.randomState = seed;
+    this.nextObstacleX = 500;
+    this.nextObstacleId = 1;
+    this.game = {
+      tick: 0,
+      character: {
+        x: 80,
+        y: WORLD_HEIGHT / 2,
+      },
+      score: 0,
+      averageVolume: 0.5,
+      levelSeed: this.randomState,
+      obstacles: [],
+      gameOverReason: null,
+    };
+    this.ctx.storage.sql.exec("UPDATE rooms SET status = 'playing'");
+    this.spawnObstacles();
+    this.startGameLoop();
+    this.broadcastState();
+  }
+
+  private reportVolume(socket: WebSocket, volume: number): void {
+    const playerId = this.sockets.get(socket);
+    if (!playerId || !Number.isFinite(volume)) {
+      return;
+    }
+
+    this.playerVolumes.set(playerId, {
+      volume: Math.max(0, Math.min(1, volume)),
+      lastReportedAt: Date.now(),
+    });
+  }
+
+  private markMicReady(socket: WebSocket): void {
+    const playerId = this.sockets.get(socket);
+    if (!playerId) {
+      return;
+    }
+
+    this.micReady.add(playerId);
+    this.broadcastState();
+  }
+
+  private startGameLoop(): void {
+    if (this.gameLoop) {
+      clearInterval(this.gameLoop);
+    }
+
+    this.gameLoop = setInterval(() => this.tickGame(), TICK_MS);
+  }
+
+  private tickGame(): void {
+    if (!this.game) {
+      return;
+    }
+
+    const now = Date.now();
+    const connectedPlayerIds = [...new Set(this.sockets.values())];
+    let totalVolume = 0;
+    for (const playerId of connectedPlayerIds) {
+      const report = this.playerVolumes.get(playerId);
+      if (report && now - report.lastReportedAt <= 500) {
+        totalVolume += report.volume;
+      }
+    }
+
+    const deltaSeconds = TICK_MS / 1000;
+    const character = this.game.character;
+    const averageVolume = connectedPlayerIds.length > 0
+      ? totalVolume / connectedPlayerIds.length
+      : 0;
+    this.game.averageVolume = averageVolume;
+    character.y = Math.max(0, Math.min(WORLD_HEIGHT, averageVolume * WORLD_HEIGHT));
+
+    character.x += RUN_SPEED * deltaSeconds;
+    this.game.score = Math.floor(character.x / 10);
+    this.game.tick += 1;
+    this.spawnObstacles();
+
+    this.game.obstacles = this.game.obstacles.filter(
+      (obstacle) => obstacle.x + obstacle.width > character.x - 120,
+    );
+
+    if (character.y >= WORLD_HEIGHT - CEILING_SPIKE_HEIGHT) {
+      this.endGame("Too loud! The pickle hit the ceiling spikes.");
+      return;
+    }
+
+    const pickleLeft = character.x + 8;
+    const pickleRight = character.x + 32;
+    for (const obstacle of this.game.obstacles) {
+      const overlapsX = pickleRight > obstacle.x && pickleLeft < obstacle.x + obstacle.width;
+      const hitsObstacle = obstacle.fromTop
+        ? character.y + PICKLE_HEIGHT > WORLD_HEIGHT - obstacle.height
+        : character.y < obstacle.height;
+      if (overlapsX && hitsObstacle) {
+        this.endGame("The pickle hit a kitchen obstacle.");
+        return;
+      }
+    }
+
+    this.broadcastState();
+  }
+
+  private spawnObstacles(): void {
+    if (!this.game) {
+      return;
+    }
+
+    while (this.nextObstacleX < this.game.character.x + 1000) {
+      const obstacle: Obstacle = {
+        id: this.nextObstacleId,
+        x: this.nextObstacleX,
+        width: 35 + Math.floor(this.nextRandom() * 45),
+        height: 20 + Math.floor(this.nextRandom() * 55),
+        fromTop: this.nextObstacleId % 2 === 0,
+      };
+      this.nextObstacleId += 1;
+      this.game.obstacles.push(obstacle);
+      this.nextObstacleX += 260 + Math.floor(this.nextRandom() * 220);
+    }
+  }
+
+  private nextRandom(): number {
+    this.randomState = (1664525 * this.randomState + 1013904223) >>> 0;
+    return this.randomState / 4294967296;
+  }
+
+  private endGame(reason: string): void {
+    if (!this.game) {
+      return;
+    }
+
+    this.game.gameOverReason = reason;
+    const finalScore = this.game.score;
+    this.ctx.storage.sql.exec("UPDATE rooms SET status = 'finished'");
+    if (this.gameLoop) {
+      clearInterval(this.gameLoop);
+      this.gameLoop = null;
+    }
+
+    this.broadcastState();
+    this.broadcast({ type: "gameOver", finalScore, reason });
+  }
+
+  private broadcast(message: ServerMessage): void {
+    for (const socket of this.sockets.keys()) {
+      this.send(socket, message);
+    }
+  }
+
+  private isHost(playerId: string): boolean {
+    const rows = this.ctx.storage.sql
+      .exec("SELECT id FROM players WHERE id = ? AND is_host = 1 AND connected = 1", playerId)
+      .toArray();
+    return rows.length > 0;
   }
 
   private reassignHostIfNeeded(leavingPlayerId: string): void {
