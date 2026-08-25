@@ -5,6 +5,7 @@ const roomCodeText = document.querySelector("#room-code");
 const playersList = document.querySelector("#players");
 
 let socket;
+const savedRoomKey = "in-a-pickle-room";
 
 function showStatus(message) {
   statusText.textContent = message;
@@ -22,6 +23,7 @@ function renderState(state) {
 }
 
 function connectToRoom(room) {
+  localStorage.setItem(savedRoomKey, JSON.stringify(room));
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${protocol}//${location.host}/ws?roomCode=${encodeURIComponent(room.roomCode)}&playerId=${encodeURIComponent(room.playerId)}`;
   socket = new WebSocket(url);
@@ -46,6 +48,20 @@ function connectToRoom(room) {
   socket.addEventListener("error", () => {
     showStatus("Could not connect to the room.");
   });
+}
+
+function tryReconnect() {
+  const savedRoom = localStorage.getItem(savedRoomKey);
+  if (!savedRoom) {
+    return;
+  }
+
+  try {
+    showStatus("Reconnecting to your room...");
+    connectToRoom(JSON.parse(savedRoom));
+  } catch {
+    localStorage.removeItem(savedRoomKey);
+  }
 }
 
 async function joinApi(url, name) {
@@ -87,3 +103,5 @@ document.querySelector("#join-form").addEventListener("submit", async (event) =>
     showStatus(error.message);
   }
 });
+
+tryReconnect();
