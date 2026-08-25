@@ -61,7 +61,12 @@ export class GameRoom extends DurableObject {
     }
 
     if (url.pathname === "/internal/state" && request.method === "GET") {
-      return Response.json(this.getState());
+      const state = this.getState();
+      if (!state.roomCode) {
+        return Response.json({ error: "Room does not exist." }, { status: 404 });
+      }
+
+      return Response.json(state);
     }
 
     if (url.pathname === "/ws" && request.headers.get("Upgrade") === "websocket") {
@@ -259,6 +264,7 @@ export class GameRoom extends DurableObject {
       Date.now(),
       playerId,
     );
+    this.reassignHostIfNeeded(playerId);
 
     if (this.activePlayerCount() === 0) {
       this.closeRoom();
@@ -267,6 +273,26 @@ export class GameRoom extends DurableObject {
 
     this.ctx.storage.setAlarm(Date.now() + RECONNECT_GRACE_MS);
     this.broadcastState();
+  }
+
+  private reassignHostIfNeeded(leavingPlayerId: string): void {
+    const connectedHosts = this.ctx.storage.sql
+      .exec("SELECT id FROM players WHERE is_host = 1 AND connected = 1")
+      .toArray();
+    if (connectedHosts.length > 0) {
+      return;
+    }
+
+    const candidates = this.ctx.storage.sql
+      .exec("SELECT id FROM players WHERE connected = 1 AND id != ? ORDER BY RANDOM() LIMIT 1", leavingPlayerId)
+      .toArray() as unknown as Array<{ id: string }>;
+    const newHostId = candidates[0]?.id;
+    if (!newHostId) {
+      return;
+    }
+
+    this.ctx.storage.sql.exec("UPDATE players SET is_host = 0");
+    this.ctx.storage.sql.exec("UPDATE players SET is_host = 1 WHERE id = ?", newHostId);
   }
 
   private send(socket: WebSocket, message: ServerMessage): void {

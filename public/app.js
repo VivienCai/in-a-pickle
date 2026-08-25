@@ -3,6 +3,12 @@ const lobby = document.querySelector("#lobby");
 const statusText = document.querySelector("#status");
 const roomCodeText = document.querySelector("#room-code");
 const playersList = document.querySelector("#players");
+const disconnectActions = document.querySelector("#disconnect-actions");
+const rejoinButton = document.querySelector("#rejoin-button");
+const newRoomButton = document.querySelector("#new-room-button");
+const rejoinPrompt = document.querySelector("#rejoin-prompt");
+const rejoinCodeText = document.querySelector("#rejoin-code");
+const rejoinYesButton = document.querySelector("#rejoin-yes");
 
 let socket;
 const savedRoomKey = "in-a-pickle-room";
@@ -27,10 +33,14 @@ function connectToRoom(room) {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${protocol}//${location.host}/ws?roomCode=${encodeURIComponent(room.roomCode)}&playerId=${encodeURIComponent(room.playerId)}`;
   socket = new WebSocket(url);
+  let connected = false;
 
   socket.addEventListener("open", () => {
+    connected = true;
+    rejoinPrompt.classList.add("hidden");
     entry.classList.add("hidden");
     lobby.classList.remove("hidden");
+    disconnectActions.classList.add("hidden");
     showStatus("Connected to the room.");
   });
 
@@ -42,27 +52,85 @@ function connectToRoom(room) {
   });
 
   socket.addEventListener("close", () => {
-    showStatus("Disconnected from the room.");
-  });
+    if (!connected) {
+      localStorage.removeItem(savedRoomKey);
+      rejoinPrompt.classList.add("hidden");
+      lobby.classList.add("hidden");
+      disconnectActions.classList.add("hidden");
+      entry.classList.remove("hidden");
+      showStatus(`Room ${room.roomCode} is no longer available.`);
+      return;
+    }
 
-  socket.addEventListener("error", () => {
-    showStatus("Could not connect to the room.");
+    disconnectActions.classList.remove("hidden");
+    rejoinButton.textContent = `Rejoin Room ${room.roomCode}`;
   });
 }
 
-function tryReconnect() {
+rejoinButton.addEventListener("click", () => {
+  const savedRoom = localStorage.getItem(savedRoomKey);
+  if (!savedRoom) {
+    showStatus("Your room information is no longer available.");
+    return;
+  }
+
+  try {
+    connectToRoom(JSON.parse(savedRoom));
+    showStatus("Rejoining room...");
+  } catch {
+    localStorage.removeItem(savedRoomKey);
+    showStatus("Your room information is invalid.");
+  }
+});
+
+newRoomButton.addEventListener("click", () => {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.close();
+  }
+
+  localStorage.removeItem(savedRoomKey);
+  lobby.classList.add("hidden");
+  entry.classList.remove("hidden");
+  disconnectActions.classList.add("hidden");
+  rejoinPrompt.classList.add("hidden");
+  showStatus("Ready to join a new room.");
+});
+
+function showRejoinPrompt() {
   const savedRoom = localStorage.getItem(savedRoomKey);
   if (!savedRoom) {
     return;
   }
 
+  let room;
   try {
-    showStatus("Reconnecting to your room...");
-    connectToRoom(JSON.parse(savedRoom));
+    room = JSON.parse(savedRoom);
   } catch {
     localStorage.removeItem(savedRoomKey);
+    return;
   }
+
+  if (!room.roomCode || !room.playerId) {
+    localStorage.removeItem(savedRoomKey);
+    return;
+  }
+
+  rejoinCodeText.textContent = room.roomCode;
+  rejoinYesButton.textContent = `Rejoin Room ${room.roomCode}`;
+  rejoinPrompt.classList.remove("hidden");
 }
+
+rejoinYesButton.addEventListener("click", () => {
+  const savedRoom = localStorage.getItem(savedRoomKey);
+  if (!savedRoom) {
+    rejoinPrompt.classList.add("hidden");
+    return;
+  }
+
+  const room = JSON.parse(savedRoom);
+  showStatus(`Rejoining Room ${room.roomCode}...`);
+  connectToRoom(room);
+});
 
 async function joinApi(url, name) {
   const response = await fetch(url, {
@@ -104,4 +172,4 @@ document.querySelector("#join-form").addEventListener("submit", async (event) =>
   }
 });
 
-tryReconnect();
+showRejoinPrompt();
