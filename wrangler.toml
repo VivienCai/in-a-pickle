@@ -1,4 +1,5 @@
 name = "in-a-pickle"
+account_id = "0f8e8a0bcbe9713b1227d70488e1a9d8"
 main = "src/index.ts"
 compatibility_date = "2025-05-01"
 

@@ -2,9 +2,12 @@
   "name": "in-a-pickle",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "test:room": "node tests/room.smoke.mjs",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

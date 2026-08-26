@@ -1,5 +1,18 @@
 import { DurableObject } from "cloudflare:workers";
 import { addParticipant, createMeeting } from "./realtimeKit";
+import {
+  hitsCeilingSpikes,
+  isQteSuccess,
+  isQteVolumeInTarget,
+  PICKLE_HEIGHT,
+  QTE_DURATION_TICKS,
+  QTE_FIRST_TICK,
+  QTE_INTERVAL_TICKS,
+  QTE_RESULT_TICKS,
+  TICK_MS,
+  WORLD_HEIGHT,
+} from "./gameRules";
+import { deleteClip, prepareClipAudio, uploadClip } from "./stream";
 import type {
   ClientMessage,
   LiveGameState,
@@ -25,11 +38,19 @@ interface StoredPlayer {
   is_host: number;
   connected: number;
   last_seen_at: number;
+  recording_ready: number;
+  clip_uid: string | null;
+  clip_url: string | null;
+  triumph_clip_uid: string | null;
+  triumph_clip_url: string | null;
 }
 
 interface RoomRow {
   code: string;
   status: RoomState["status"];
+  recording_stage: "death" | "triumph" | null;
+  final_score: number | null;
+  game_over_reason: string | null;
 }
 
 interface MeetingRow {
@@ -37,12 +58,9 @@ interface MeetingRow {
 }
 
 const RECONNECT_GRACE_MS = 5 * 60 * 1000;
-const TICK_MS = 50;
-const RUN_SPEED = 180;
-const WORLD_HEIGHT = 350;
-const PICKLE_HEIGHT = 48;
-const CEILING_SPIKE_HEIGHT = 60;
+const RUN_SPEED = 145;
 const SPEAKING_VOLUME_THRESHOLD = 0.15;
+const PROCESSING_RETRY_MS = 70 * 1000;
 
 export class GameRoom extends DurableObject<Env> {
   private readonly sockets = new Map<WebSocket, string>();
@@ -52,7 +70,7 @@ export class GameRoom extends DurableObject<Env> {
   private gameLoop: ReturnType<typeof setInterval> | null = null;
   private lastLobbyVoiceBroadcastAt = 0;
   private randomState = 1;
-  private nextObstacleX = 500;
+  private nextObstacleX = 650;
   private nextObstacleId = 1;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -77,7 +95,17 @@ export class GameRoom extends DurableObject<Env> {
     `);
     this.ensurePlayerColumn("connected", "INTEGER NOT NULL DEFAULT 0");
     this.ensurePlayerColumn("last_seen_at", "INTEGER NOT NULL DEFAULT 0");
+    this.ensurePlayerColumn("recording_ready", "INTEGER NOT NULL DEFAULT 0");
+    this.ensurePlayerColumn("clip_uid", "TEXT");
+    this.ensurePlayerColumn("clip_url", "TEXT");
+    this.ensurePlayerColumn("triumph_clip_uid", "TEXT");
+    this.ensurePlayerColumn("triumph_clip_url", "TEXT");
     this.ensureRoomColumn("meeting_id", "TEXT");
+    this.ensureRoomColumn("recording_stage", "TEXT");
+    this.ensureRoomColumn("final_score", "INTEGER");
+    this.ensureRoomColumn("game_over_reason", "TEXT");
+    this.restoreFinishedGame();
+    this.scheduleNextAlarm();
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -100,8 +128,16 @@ export class GameRoom extends DurableObject<Env> {
       return Response.json(state);
     }
 
+    if (url.pathname === "/internal/rejoin" && request.method === "GET") {
+      return this.validateRejoin(request);
+    }
+
     if (url.pathname === "/internal/voice" && request.method === "GET") {
       return this.createVoiceToken(request);
+    }
+
+    if (url.pathname === "/internal/sfx" && request.method === "POST") {
+      return this.saveClip(request);
     }
 
     if (url.pathname === "/ws" && request.headers.get("Upgrade") === "websocket") {
@@ -135,12 +171,14 @@ export class GameRoom extends DurableObject<Env> {
       meetingId,
     );
     this.ctx.storage.sql.exec(
-      "INSERT INTO players (id, room_code, name, is_host, joined_at) VALUES (?, ?, ?, 1, ?)",
+      "INSERT INTO players (id, room_code, name, is_host, joined_at, connected, last_seen_at) VALUES (?, ?, ?, 1, ?, 0, ?)",
       playerId,
       roomCode,
       name,
       now,
+      now,
     );
+    this.scheduleNextAlarm();
 
     return Response.json({ roomCode, playerId, isHost: true });
   }
@@ -158,6 +196,9 @@ export class GameRoom extends DurableObject<Env> {
     if (room.length === 0) {
       return Response.json({ error: "Room does not exist." }, { status: 404 });
     }
+    if (room[0]?.status !== "lobby") {
+      return Response.json({ error: "This room is already getting ready to play." }, { status: 409 });
+    }
 
     const playerCount = this.ctx.storage.sql.exec("SELECT COUNT(*) AS count FROM players WHERE room_code = ?", roomCode).toArray() as Array<{ count: number }>;
     if ((playerCount[0]?.count ?? 0) >= 8) {
@@ -173,6 +214,7 @@ export class GameRoom extends DurableObject<Env> {
       Date.now(),
       Date.now(),
     );
+    this.scheduleNextAlarm();
 
     this.broadcastState();
     return Response.json({ roomCode, playerId, isHost: false });
@@ -198,11 +240,18 @@ export class GameRoom extends DurableObject<Env> {
       roomCode,
     );
     this.sockets.set(server, playerId);
+    for (const [existingSocket, existingPlayerId] of this.sockets) {
+      if (existingSocket !== server && existingPlayerId === playerId) {
+        this.sockets.delete(existingSocket);
+        existingSocket.close(1000, "Reconnected in another tab");
+      }
+    }
     server.addEventListener("message", (event) => this.handleMessage(server, event.data));
     server.addEventListener("close", () => this.disconnectPlayer(server));
     server.addEventListener("error", () => this.disconnectPlayer(server));
     this.sendState(server);
     this.broadcastState();
+    this.scheduleNextAlarm();
 
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -235,21 +284,51 @@ export class GameRoom extends DurableObject<Env> {
   }
 
   private getState(): RoomState {
-    const roomRows = this.ctx.storage.sql.exec("SELECT code, status FROM rooms LIMIT 1").toArray() as unknown as RoomRow[];
-    const playerRows = this.ctx.storage.sql.exec("SELECT id, name, is_host, connected, last_seen_at FROM players WHERE connected = 1 ORDER BY joined_at").toArray() as unknown as StoredPlayer[];
+    const roomRows = this.ctx.storage.sql.exec("SELECT code, status, recording_stage, final_score, game_over_reason FROM rooms LIMIT 1").toArray() as unknown as RoomRow[];
+    const playerRows = this.ctx.storage.sql.exec("SELECT id, name, is_host, connected, last_seen_at, recording_ready, clip_uid, clip_url, triumph_clip_uid, triumph_clip_url FROM players WHERE connected = 1 ORDER BY joined_at").toArray() as unknown as StoredPlayer[];
     const now = Date.now();
 
     return {
       roomCode: roomRows[0]?.code ?? "",
       status: roomRows[0]?.status ?? "lobby",
+      recordingStage: roomRows[0]?.recording_stage ?? null,
+      soundsReady: this.allPlayerClipsReady(),
+      stageSoundsReady: roomRows[0]?.recording_stage === "death" || roomRows[0]?.recording_stage === "triumph"
+        ? this.allStageClipsReady(roomRows[0].recording_stage)
+        : false,
+      recordingsSubmitted: this.allPlayersReady(),
+      hasDisconnectedPlayers: this.hasDisconnectedPlayers(),
       players: playerRows.map((player): Player => ({
         id: player.id,
         name: player.name,
         isHost: player.is_host === 1,
         micReady: this.micReady.has(player.id),
         speaking: this.isSpeaking(player.id, now),
+        recordingReady: player.recording_ready === 1,
+        hasDeathClip: Boolean(player.clip_url),
+        hasTriumphClip: Boolean(player.triumph_clip_url),
       })),
     };
+  }
+
+  private validateRejoin(request: Request): Response {
+    const url = new URL(request.url);
+    const roomCode = url.searchParams.get("roomCode")?.toUpperCase();
+    const playerId = url.searchParams.get("playerId");
+    if (!roomCode || !playerId) {
+      return Response.json({ canRejoin: false }, { status: 400 });
+    }
+
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT connected, last_seen_at FROM players WHERE id = ? AND room_code = ?",
+      playerId,
+      roomCode,
+    ).toArray() as unknown as Array<{ connected: number; last_seen_at: number }>;
+    const player = rows[0];
+    const canRejoin = Boolean(
+      player && (player.connected === 1 || Date.now() - player.last_seen_at <= RECONNECT_GRACE_MS),
+    );
+    return Response.json({ canRejoin });
   }
 
   private async createVoiceToken(request: Request): Promise<Response> {
@@ -281,6 +360,132 @@ export class GameRoom extends DurableObject<Env> {
     return Response.json({ voiceToken });
   }
 
+  private async saveClip(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const roomCode = url.searchParams.get("roomCode")?.toUpperCase();
+    const playerId = url.searchParams.get("playerId");
+    const requestedStage = url.searchParams.get("stage");
+    if (!roomCode || !playerId || !this.playerExists(roomCode, playerId)) {
+      return Response.json({ error: "Invalid room or player." }, { status: 401 });
+    }
+
+    const state = this.getState();
+    if (state.status !== "recording") {
+      return Response.json({ error: "Sound recording is not open right now." }, { status: 409 });
+    }
+
+    const clip = await request.blob();
+    if (clip.size === 0 || clip.size > 1024 * 1024) {
+      return Response.json({ error: "Sound clips must be between 1 byte and 1 MB." }, { status: 413 });
+    }
+
+    const roomRows = this.ctx.storage.sql.exec(
+      "SELECT recording_stage FROM rooms WHERE code = ?", roomCode,
+    ).toArray() as unknown as Array<{ recording_stage: "death" | "triumph" | null }>;
+    const stage = roomRows[0]?.recording_stage;
+    if (
+      (stage !== "death" && stage !== "triumph") ||
+      requestedStage !== stage
+    ) {
+      return Response.json({ error: "Sound recording is not open right now." }, { status: 409 });
+    }
+
+    const uploaded = await uploadClip(this.env, clip);
+    if (!uploaded.ok) {
+      const tokenHelp = /auth|permission/i.test(uploaded.error)
+        ? " Give the API token Account > Stream > Edit permission, then restart Wrangler."
+        : "";
+      return Response.json({ error: `Could not upload that sound clip: ${uploaded.error}${tokenHelp}` }, { status: 502 });
+    }
+
+    const currentRoom = this.ctx.storage.sql.exec(
+      "SELECT status, recording_stage FROM rooms WHERE code = ?",
+      roomCode,
+    ).toArray() as unknown as Array<{ status: RoomState["status"]; recording_stage: "death" | "triumph" | null }>;
+    if (
+      currentRoom[0]?.status !== "recording" ||
+      currentRoom[0]?.recording_stage !== stage ||
+      !this.playerExists(roomCode, playerId)
+    ) {
+      await deleteClip(this.env, uploaded.uid);
+      return Response.json({ error: "The recording round changed while that clip was uploading." }, { status: 409 });
+    }
+
+    const uidColumn = stage === "death" ? "clip_uid" : "triumph_clip_uid";
+    const urlColumn = stage === "death" ? "clip_url" : "triumph_clip_url";
+    const existing = this.ctx.storage.sql
+      .exec(`SELECT ${uidColumn} AS clip_uid FROM players WHERE id = ? AND room_code = ?`, playerId, roomCode)
+      .toArray() as unknown as Array<{ clip_uid: string | null }>;
+    const previousUid = existing[0]?.clip_uid;
+    this.ctx.storage.sql.exec(
+      `UPDATE players SET ${uidColumn} = ?, ${urlColumn} = ?, recording_ready = 1 WHERE id = ? AND room_code = ?`,
+      uploaded.uid,
+      null,
+      playerId,
+      roomCode,
+    );
+    if (previousUid && previousUid !== uploaded.uid) {
+      this.ctx.waitUntil(deleteClip(this.env, previousUid));
+    }
+
+    this.ctx.waitUntil(this.preparePlayerClip(roomCode, playerId, stage, uploaded.uid));
+    this.scheduleNextAlarm();
+
+    this.broadcastState();
+
+    return Response.json({ ok: true });
+  }
+
+  private async preparePlayerClip(
+    roomCode: string,
+    playerId: string,
+    stage: "death" | "triumph",
+    uid: string,
+  ): Promise<void> {
+    const result = await prepareClipAudio(this.env, uid);
+    const uidColumn = stage === "death" ? "clip_uid" : "triumph_clip_uid";
+    const urlColumn = stage === "death" ? "clip_url" : "triumph_clip_url";
+    const current = this.ctx.storage.sql
+      .exec(`SELECT ${uidColumn} AS clip_uid FROM players WHERE id = ? AND room_code = ?`, playerId, roomCode)
+      .toArray() as unknown as Array<{ clip_uid: string | null }>;
+    if (current[0]?.clip_uid !== uid) {
+      await deleteClip(this.env, uid);
+      return;
+    }
+
+    if (!result.ok) {
+      if (result.retryable) {
+        this.scheduleNextAlarm(10_000);
+        return;
+      }
+      await deleteClip(this.env, uid);
+      this.ctx.storage.sql.exec(
+        `UPDATE players SET ${uidColumn} = NULL, ${urlColumn} = NULL, recording_ready = 0 WHERE id = ? AND room_code = ?`,
+        playerId,
+        roomCode,
+      );
+      for (const [socket, socketPlayerId] of this.sockets) {
+        if (socketPlayerId === playerId) {
+          this.send(socket, { type: "error", message: result.error });
+        }
+      }
+      this.broadcastState();
+      this.scheduleNextAlarm();
+      return;
+    }
+
+    this.ctx.storage.sql.exec(
+      `UPDATE players SET ${urlColumn} = ? WHERE id = ? AND room_code = ? AND ${uidColumn} = ?`,
+      result.audioUrl,
+      playerId,
+      roomCode,
+      uid,
+    );
+    this.broadcastState();
+    this.advanceRecordingIfReady();
+    this.scheduleNextAlarm();
+  }
+
   private playerExists(roomCode: string, playerId: string): boolean {
     const rows = this.ctx.storage.sql.exec("SELECT id FROM players WHERE id = ? AND room_code = ?", playerId, roomCode).toArray();
     return rows.length > 0;
@@ -298,23 +503,39 @@ export class GameRoom extends DurableObject<Env> {
 
   async alarm(): Promise<void> {
     const cutoff = Date.now() - RECONNECT_GRACE_MS;
+    const expired = this.ctx.storage.sql.exec(
+      `SELECT id, clip_uid, triumph_clip_uid
+       FROM players WHERE connected = 0 AND last_seen_at <= ?`,
+      cutoff,
+    ).toArray() as unknown as Array<{
+      id: string;
+      clip_uid: string | null;
+      triumph_clip_uid: string | null;
+    }>;
     this.ctx.storage.sql.exec(
       "DELETE FROM players WHERE connected = 0 AND last_seen_at <= ?",
       cutoff,
     );
+    await Promise.all(expired
+      .flatMap((player) => [player.clip_uid, player.triumph_clip_uid])
+      .filter((uid): uid is string => uid !== null)
+      .map((uid) => deleteClip(this.env, uid)));
 
-    if (this.activePlayerCount() === 0) {
-      this.closeRoom();
+    if (this.totalPlayerCount() === 0) {
+      await this.closeRoom();
       return;
     }
 
-    const disconnected = this.ctx.storage.sql.exec(
-      "SELECT id FROM players WHERE connected = 0 AND last_seen_at > ?",
-      cutoff,
-    ).toArray();
-    if (disconnected.length > 0) {
-      this.ctx.storage.setAlarm(Date.now() + RECONNECT_GRACE_MS);
-    }
+    this.reassignHostIfNeeded("");
+    const pending = this.pendingClips();
+    await Promise.all(pending.map((clip) => this.preparePlayerClip(
+      clip.roomCode,
+      clip.playerId,
+      clip.stage,
+      clip.uid,
+    )));
+    this.advanceRecordingIfReady();
+    this.scheduleNextAlarm(10_000);
   }
 
   private ensurePlayerColumn(name: string, definition: string): void {
@@ -331,6 +552,93 @@ export class GameRoom extends DurableObject<Env> {
     }
   }
 
+  private restoreFinishedGame(): void {
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT status, final_score, game_over_reason FROM rooms LIMIT 1",
+    ).toArray() as unknown as Array<{
+      status: RoomState["status"];
+      final_score: number | null;
+      game_over_reason: string | null;
+    }>;
+    const room = rows[0];
+    if (!room || (room.status !== "playing" && room.status !== "finished")) {
+      return;
+    }
+
+    const interrupted = room.status === "playing";
+    const score = room.final_score ?? 0;
+    const reason = interrupted
+      ? "The run was interrupted by a server update. The host can restart it."
+      : room.game_over_reason ?? "Run finished.";
+    if (interrupted) {
+      this.ctx.storage.sql.exec(
+        "UPDATE rooms SET status = 'finished', final_score = ?, game_over_reason = ?",
+        score,
+        reason,
+      );
+    }
+    this.game = {
+      tick: 0,
+      character: { x: Math.max(80, score * 10), y: WORLD_HEIGHT / 2 },
+      score,
+      coins: 0,
+      averageVolume: 0.5,
+      levelSeed: 1,
+      obstacles: [],
+      gameOverReason: reason,
+      qte: null,
+      qteResult: null,
+      nextQteTick: QTE_FIRST_TICK,
+    };
+  }
+
+  private pendingClips(): Array<{
+    roomCode: string;
+    playerId: string;
+    stage: "death" | "triumph";
+    uid: string;
+  }> {
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT id, room_code, clip_uid, clip_url, triumph_clip_uid, triumph_clip_url
+       FROM players`,
+    ).toArray() as unknown as StoredPlayer[];
+    return rows.flatMap((player) => {
+      const pending: Array<{
+        roomCode: string;
+        playerId: string;
+        stage: "death" | "triumph";
+        uid: string;
+      }> = [];
+      if (player.clip_uid && !player.clip_url) {
+        pending.push({ roomCode: player.room_code, playerId: player.id, stage: "death", uid: player.clip_uid });
+      }
+      if (player.triumph_clip_uid && !player.triumph_clip_url) {
+        pending.push({ roomCode: player.room_code, playerId: player.id, stage: "triumph", uid: player.triumph_clip_uid });
+      }
+      return pending;
+    });
+  }
+
+  private scheduleNextAlarm(pendingDelayMs = PROCESSING_RETRY_MS): void {
+    const deadlines: number[] = [];
+    const disconnected = this.ctx.storage.sql.exec(
+      "SELECT MIN(last_seen_at) AS last_seen_at FROM players WHERE connected = 0",
+    ).toArray() as unknown as Array<{ last_seen_at: number | null }>;
+    const lastSeenAt = disconnected[0]?.last_seen_at;
+    if (lastSeenAt !== null && lastSeenAt !== undefined) {
+      deadlines.push(lastSeenAt + RECONNECT_GRACE_MS);
+    }
+    if (this.pendingClips().length > 0) {
+      deadlines.push(Date.now() + pendingDelayMs);
+    }
+
+    if (deadlines.length > 0) {
+      void this.ctx.storage.setAlarm(Math.max(Date.now() + 100, Math.min(...deadlines)));
+    } else {
+      void this.ctx.storage.deleteAlarm();
+    }
+  }
+
   private isSpeaking(playerId: string, now: number): boolean {
     const report = this.playerVolumes.get(playerId);
     return Boolean(
@@ -340,20 +648,74 @@ export class GameRoom extends DurableObject<Env> {
     );
   }
 
-  private activePlayerCount(): number {
-    const rows = this.ctx.storage.sql.exec("SELECT COUNT(*) AS count FROM players WHERE connected = 1").toArray() as unknown as Array<{ count: number }>;
+  private totalPlayerCount(): number {
+    const rows = this.ctx.storage.sql.exec("SELECT COUNT(*) AS count FROM players").toArray() as unknown as Array<{ count: number }>;
     return rows[0]?.count ?? 0;
   }
 
-  private closeRoom(): void {
+  private hasDisconnectedPlayers(): boolean {
+    const rows = this.ctx.storage.sql.exec("SELECT 1 FROM players WHERE connected = 0 LIMIT 1").toArray();
+    return rows.length > 0;
+  }
+
+  private allPlayersReady(): boolean {
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT COUNT(*) AS total, SUM(recording_ready) AS ready FROM players",
+    ).toArray() as unknown as Array<{ total: number; ready: number | null }>;
+    const total = rows[0]?.total ?? 0;
+    return total > 0 && (rows[0]?.ready ?? 0) === total;
+  }
+
+  private allPlayerClipsReady(): boolean {
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT COUNT(*) AS total,
+        SUM(CASE WHEN clip_url IS NOT NULL AND triumph_clip_url IS NOT NULL THEN 1 ELSE 0 END) AS ready
+       FROM players`,
+    ).toArray() as unknown as Array<{ total: number; ready: number | null }>;
+    const total = rows[0]?.total ?? 0;
+    return total > 0 && (rows[0]?.ready ?? 0) === total;
+  }
+
+  private allStageClipsReady(stage: "death" | "triumph"): boolean {
+    const column = stage === "death" ? "clip_url" : "triumph_clip_url";
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT COUNT(*) AS total, SUM(CASE WHEN ${column} IS NOT NULL THEN 1 ELSE 0 END) AS ready FROM players`,
+    ).toArray() as unknown as Array<{ total: number; ready: number | null }>;
+    const total = rows[0]?.total ?? 0;
+    return total > 0 && (rows[0]?.ready ?? 0) === total;
+  }
+
+  private advanceRecordingIfReady(): void {
+    const state = this.getState();
+    if (state.status !== "recording" || state.hasDisconnectedPlayers) {
+      return;
+    }
+
+    if (state.recordingStage === "death" && this.allStageClipsReady("death")) {
+      this.ctx.storage.sql.exec("UPDATE rooms SET recording_stage = 'triumph'");
+      this.ctx.storage.sql.exec(
+        "UPDATE players SET recording_ready = CASE WHEN triumph_clip_uid IS NOT NULL THEN 1 ELSE 0 END",
+      );
+      this.broadcastState();
+      return;
+    }
+
+  }
+
+  private async closeRoom(): Promise<void> {
     if (this.gameLoop) {
       clearInterval(this.gameLoop);
       this.gameLoop = null;
     }
     this.game = null;
+    const clips = this.ctx.storage.sql.exec("SELECT clip_uid, triumph_clip_uid FROM players").toArray() as unknown as Array<{ clip_uid: string | null; triumph_clip_uid: string | null }>;
     this.ctx.storage.sql.exec("DELETE FROM players");
     this.ctx.storage.sql.exec("DELETE FROM rooms");
     this.ctx.storage.deleteAlarm();
+    const clipIds = clips
+      .flatMap((clip) => [clip.clip_uid, clip.triumph_clip_uid])
+      .filter((uid): uid is string => uid !== null);
+    await Promise.all(clipIds.map((uid) => deleteClip(this.env, uid)));
   }
 
   private disconnectPlayer(socket: WebSocket): void {
@@ -363,21 +725,20 @@ export class GameRoom extends DurableObject<Env> {
     }
 
     this.sockets.delete(socket);
+    if ([...this.sockets.values()].includes(playerId)) {
+      return;
+    }
     this.micReady.delete(playerId);
+    this.playerVolumes.delete(playerId);
     this.ctx.storage.sql.exec(
       "UPDATE players SET connected = 0, last_seen_at = ? WHERE id = ?",
       Date.now(),
       playerId,
     );
     this.reassignHostIfNeeded(playerId);
-
-    if (this.activePlayerCount() === 0) {
-      this.closeRoom();
-      return;
-    }
-
-    this.ctx.storage.setAlarm(Date.now() + RECONNECT_GRACE_MS);
+    this.scheduleNextAlarm();
     this.broadcastState();
+    this.advanceRecordingIfReady();
   }
 
   private startGame(socket: WebSocket): void {
@@ -388,14 +749,32 @@ export class GameRoom extends DurableObject<Env> {
     }
 
     const room = this.getState();
+    if (room.hasDisconnectedPlayers) {
+      this.send(socket, { type: "error", message: "Wait for disconnected players to rejoin before continuing." });
+      return;
+    }
+    if (room.status === "recording") {
+      if (
+        room.recordingStage !== "triumph" ||
+        !this.allPlayersReady() ||
+        !this.allPlayerClipsReady()
+      ) {
+        this.send(socket, { type: "error", message: "Everyone's sounds must finish processing first." });
+        return;
+      }
+
+      this.beginGame(this.makeSeed());
+      return;
+    }
+
     if (room.status !== "lobby") {
       this.send(socket, { type: "error", message: "This game has already started." });
       return;
     }
 
-    const seedBytes = new Uint32Array(1);
-    crypto.getRandomValues(seedBytes);
-    this.beginGame(seedBytes[0] || 1);
+    this.ctx.storage.sql.exec("UPDATE rooms SET status = 'recording', recording_stage = 'death'");
+    this.ctx.storage.sql.exec("UPDATE players SET recording_ready = 0");
+    this.broadcastState();
   }
 
   private restartGame(socket: WebSocket): void {
@@ -411,14 +790,12 @@ export class GameRoom extends DurableObject<Env> {
       return;
     }
 
-    const seedBytes = new Uint32Array(1);
-    crypto.getRandomValues(seedBytes);
-    this.beginGame(seedBytes[0] || 1);
+    this.beginGame(this.makeSeed());
   }
 
   private beginGame(seed: number): void {
     this.randomState = seed;
-    this.nextObstacleX = 500;
+    this.nextObstacleX = 650;
     this.nextObstacleId = 1;
     this.game = {
       tick: 0,
@@ -427,15 +804,22 @@ export class GameRoom extends DurableObject<Env> {
         y: WORLD_HEIGHT / 2,
       },
       score: 0,
+      coins: 0,
       averageVolume: 0.5,
       levelSeed: this.randomState,
       obstacles: [],
       gameOverReason: null,
+      qte: null,
+      qteResult: null,
+      nextQteTick: QTE_FIRST_TICK,
     };
-    this.ctx.storage.sql.exec("UPDATE rooms SET status = 'playing'");
+    this.ctx.storage.sql.exec(
+      "UPDATE rooms SET status = 'playing', recording_stage = NULL, final_score = NULL, game_over_reason = NULL",
+    );
     this.spawnObstacles();
     this.startGameLoop();
     this.broadcastState();
+    this.broadcastRandomClip("triumph");
   }
 
   private reportVolume(socket: WebSocket, volume: number): void {
@@ -450,7 +834,7 @@ export class GameRoom extends DurableObject<Env> {
       lastReportedAt: now,
     });
 
-    if (!this.game && now - this.lastLobbyVoiceBroadcastAt >= 100) {
+    if ((!this.game || this.game.gameOverReason) && now - this.lastLobbyVoiceBroadcastAt >= 100) {
       this.lastLobbyVoiceBroadcastAt = now;
       this.broadcastState();
     }
@@ -492,10 +876,12 @@ export class GameRoom extends DurableObject<Env> {
     const now = Date.now();
     const connectedPlayerIds = [...new Set(this.sockets.values())];
     let totalVolume = 0;
+    let freshReportCount = 0;
     for (const playerId of connectedPlayerIds) {
       const report = this.playerVolumes.get(playerId);
       if (report && now - report.lastReportedAt <= 500) {
         totalVolume += report.volume;
+        freshReportCount += 1;
       }
     }
 
@@ -504,19 +890,20 @@ export class GameRoom extends DurableObject<Env> {
     const averageVolume = connectedPlayerIds.length > 0
       ? totalVolume / connectedPlayerIds.length
       : 0;
-    this.game.averageVolume = averageVolume;
-    character.y = Math.max(0, Math.min(WORLD_HEIGHT, averageVolume * WORLD_HEIGHT));
+    this.game.averageVolume += (averageVolume - this.game.averageVolume) * 0.18;
+    character.y = Math.max(0, Math.min(WORLD_HEIGHT, this.game.averageVolume * WORLD_HEIGHT));
 
     character.x += RUN_SPEED * deltaSeconds;
     this.game.score = Math.floor(character.x / 10);
     this.game.tick += 1;
+    this.tickVoiceQte(freshReportCount);
     this.spawnObstacles();
 
     this.game.obstacles = this.game.obstacles.filter(
       (obstacle) => obstacle.x + obstacle.width > character.x - 120,
     );
 
-    if (character.y >= WORLD_HEIGHT - CEILING_SPIKE_HEIGHT) {
+    if (hitsCeilingSpikes(character.y)) {
       this.endGame("Too loud! The pickle hit the ceiling spikes.");
       return;
     }
@@ -537,6 +924,58 @@ export class GameRoom extends DurableObject<Env> {
     this.broadcastState();
   }
 
+  private tickVoiceQte(freshReportCount: number): void {
+    if (!this.game) {
+      return;
+    }
+
+    if (this.game.qteResult) {
+      this.game.qteResult.remainingTicks -= 1;
+      if (this.game.qteResult.remainingTicks <= 0) {
+        this.game.qteResult = null;
+      }
+    }
+
+    if (!this.game.qte && this.game.tick >= this.game.nextQteTick) {
+      const type = this.nextRandom() < 0.5 ? "quiet" : "steady";
+      this.game.qte = {
+        type,
+        prompt: type === "quiet" ? "Shhh! Keep the team quiet" : "Hold a steady medium volume",
+        remainingTicks: QTE_DURATION_TICKS,
+        totalTicks: QTE_DURATION_TICKS,
+        successfulTicks: 0,
+      };
+      this.game.nextQteTick = this.game.tick + QTE_INTERVAL_TICKS;
+      return;
+    }
+
+    const qte = this.game.qte;
+    if (!qte) {
+      return;
+    }
+
+    const volume = this.game.averageVolume;
+    const inTarget = freshReportCount > 0 && isQteVolumeInTarget(qte.type, volume);
+    if (inTarget) {
+      qte.successfulTicks += 1;
+    }
+    qte.remainingTicks -= 1;
+
+    if (qte.remainingTicks <= 0) {
+      const success = isQteSuccess(qte.successfulTicks, qte.totalTicks);
+      if (success) {
+        this.game.coins += 1;
+        this.broadcastRandomClip("triumph");
+      }
+      this.game.qteResult = {
+        success,
+        message: success ? "+1 coin! Nice teamwork." : "Missed it. Keep running!",
+        remainingTicks: QTE_RESULT_TICKS,
+      };
+      this.game.qte = null;
+    }
+  }
+
   private spawnObstacles(): void {
     if (!this.game) {
       return;
@@ -546,13 +985,13 @@ export class GameRoom extends DurableObject<Env> {
       const obstacle: Obstacle = {
         id: this.nextObstacleId,
         x: this.nextObstacleX,
-        width: 35 + Math.floor(this.nextRandom() * 45),
-        height: 20 + Math.floor(this.nextRandom() * 55),
+        width: 30 + Math.floor(this.nextRandom() * 30),
+        height: 18 + Math.floor(this.nextRandom() * 38),
         fromTop: this.nextObstacleId % 2 === 0,
       };
       this.nextObstacleId += 1;
       this.game.obstacles.push(obstacle);
-      this.nextObstacleX += 260 + Math.floor(this.nextRandom() * 220);
+      this.nextObstacleX += 390 + Math.floor(this.nextRandom() * 260);
     }
   }
 
@@ -568,7 +1007,11 @@ export class GameRoom extends DurableObject<Env> {
 
     this.game.gameOverReason = reason;
     const finalScore = this.game.score;
-    this.ctx.storage.sql.exec("UPDATE rooms SET status = 'finished'");
+    this.ctx.storage.sql.exec(
+      "UPDATE rooms SET status = 'finished', final_score = ?, game_over_reason = ?",
+      finalScore,
+      reason,
+    );
     if (this.gameLoop) {
       clearInterval(this.gameLoop);
       this.gameLoop = null;
@@ -576,6 +1019,26 @@ export class GameRoom extends DurableObject<Env> {
 
     this.broadcastState();
     this.broadcast({ type: "gameOver", finalScore, reason });
+    this.broadcastRandomClip("death");
+  }
+
+  private makeSeed(): number {
+    const seedBytes = new Uint32Array(1);
+    crypto.getRandomValues(seedBytes);
+    return seedBytes[0] || 1;
+  }
+
+  private broadcastRandomClip(stage: "death" | "triumph"): void {
+    const column = stage === "death" ? "clip_url" : "triumph_clip_url";
+    const clips = this.ctx.storage.sql.exec(
+      `SELECT ${column} AS clip_url FROM players WHERE connected = 1 AND ${column} IS NOT NULL`,
+    ).toArray() as unknown as Array<{ clip_url: string }>;
+    if (clips.length === 0) {
+      return;
+    }
+
+    const randomIndex = crypto.getRandomValues(new Uint32Array(1))[0] % clips.length;
+    this.broadcast({ type: "playSound", url: clips[randomIndex].clip_url });
   }
 
   private broadcast(message: ServerMessage): void {
@@ -615,7 +1078,7 @@ export class GameRoom extends DurableObject<Env> {
     try {
       socket.send(JSON.stringify(message));
     } catch {
-      this.sockets.delete(socket);
+      this.disconnectPlayer(socket);
     }
   }
 }

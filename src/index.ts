@@ -71,7 +71,7 @@ export default {
       return errorResponse("Could not create a unique room. Try again.", 500);
     }
 
-    const roomMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)(?:\/(join|state|voice))?$/);
+    const roomMatch = url.pathname.match(/^\/api\/rooms\/([^/]+)(?:\/(join|state|rejoin|voice|sfx))?$/);
     if (roomMatch) {
       const roomCode = roomMatch[1].toUpperCase();
       const action = roomMatch[2];
@@ -100,6 +100,18 @@ export default {
         return room.fetch(new Request("https://room.internal/internal/state"));
       }
 
+      if (action === "rejoin" && request.method === "GET") {
+        const playerId = url.searchParams.get("playerId");
+        if (!playerId) {
+          return errorResponse("playerId is required.");
+        }
+
+        const internalUrl = new URL("https://room.internal/internal/rejoin");
+        internalUrl.searchParams.set("roomCode", roomCode);
+        internalUrl.searchParams.set("playerId", playerId);
+        return room.fetch(new Request(internalUrl));
+      }
+
       if (action === "voice" && request.method === "GET") {
         const playerId = url.searchParams.get("playerId");
         if (!playerId) {
@@ -110,6 +122,27 @@ export default {
         internalUrl.searchParams.set("roomCode", roomCode);
         internalUrl.searchParams.set("playerId", playerId);
         return room.fetch(new Request(internalUrl));
+      }
+
+      if (action === "sfx" && request.method === "POST") {
+        const playerId = url.searchParams.get("playerId");
+        const stage = url.searchParams.get("stage");
+        if (!playerId) {
+          return errorResponse("playerId is required.");
+        }
+
+        const internalUrl = new URL("https://room.internal/internal/sfx");
+        internalUrl.searchParams.set("roomCode", roomCode);
+        internalUrl.searchParams.set("playerId", playerId);
+        if (stage === "death" || stage === "triumph") {
+          internalUrl.searchParams.set("stage", stage);
+        }
+        const contentType = request.headers.get("Content-Type") ?? "audio/webm";
+        return room.fetch(new Request(internalUrl, {
+          method: "POST",
+          headers: { "Content-Type": contentType },
+          body: await request.arrayBuffer(),
+        }));
       }
     }
 

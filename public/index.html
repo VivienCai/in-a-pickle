@@ -257,6 +257,30 @@
                 margin: 10px 0 0;
                 font-size: 0.9rem;
             }
+            #recording {
+                text-align: center;
+            }
+            #recording-progress {
+                width: 100%;
+                height: 14px;
+                margin: 14px 0;
+                accent-color: #d8523b;
+            }
+            #clip-preview {
+                width: 100%;
+                margin-top: 14px;
+            }
+            #upload-clip-button,
+            #rerecord-button {
+                margin-top: 10px;
+            }
+            #rerecord-button {
+                background: #f0bd3d;
+            }
+            #recording-players {
+                margin-top: 20px;
+                text-align: left;
+            }
             #start-button:disabled {
                 cursor: not-allowed;
                 opacity: 0.6;
@@ -271,6 +295,7 @@
                 text-align: center;
             }
         </style>
+        <link rel="stylesheet" href="/game.css" />
     </head>
     <body>
         <main>
@@ -325,10 +350,12 @@
                 <h2>Players</h2>
                 <ul id="players"></ul>
                 <button id="start-button" class="hidden" type="button">
-                    Start Run
+                    Record Sounds
                 </button>
                 <div class="mic-setup">
-                    <div class="setup-label">Asking for microphone permission...</div>
+                    <div class="setup-label">
+                        Asking for microphone permission...
+                    </div>
                     <div id="mic-status" class="mic-status-banner hidden">
                         Microphone ready
                     </div>
@@ -350,16 +377,84 @@
                 </div>
             </section>
 
+            <section id="recording" class="hidden">
+                <h2 id="recording-title">Death Sound</h2>
+                <p id="recording-copy">
+                    Record the sound you'd make when you crash into a kitchen
+                    obstacle.
+                </p>
+                <progress
+                    id="recording-progress"
+                    class="hidden"
+                    max="3"
+                    value="0"
+                ></progress>
+                <button id="record-button" type="button">
+                    Start Recording!
+                </button>
+                <audio id="clip-preview" class="hidden" controls></audio>
+                <button id="upload-clip-button" class="hidden" type="button">
+                    Use This Sound &amp; Ready Up
+                </button>
+                <button id="rerecord-button" class="hidden" type="button">
+                    Rerecord
+                </button>
+                <ul id="recording-players"></ul>
+                <p
+                    id="recording-upload-status"
+                    class="upload-status hidden"
+                ></p>
+                <button
+                    id="recording-start-button"
+                    class="hidden"
+                    type="button"
+                >
+                    Start Game
+                </button>
+            </section>
+
             <section id="game" class="hidden">
-                <div id="voice-bar" class="voice-bar"></div>
-                <div class="game-hud">
-                    <span>Score: <strong id="score">0</strong></span>
-                    <span
-                        >Average volume:
-                        <progress id="volume-meter" max="1" value="0"></progress
-                    ></span>
+                <div class="game-topbar">
+                    <span class="game-kicker">Live Team Audio</span>
+                    <div id="voice-bar" class="voice-bar"></div>
                 </div>
-                <canvas id="game-canvas" width="900" height="420"></canvas>
+                <div class="game-hud">
+                    <div class="score-stack">
+                        <div class="score-ticket">
+                            <span>Distance</span>
+                            <strong id="score">0</strong>
+                        </div>
+                        <div class="coin-ticket">
+                            <span>Coins</span>
+                            <strong id="coins">0</strong>
+                        </div>
+                    </div>
+                    <div id="volume-panel" class="volume-panel">
+                        <progress
+                            id="volume-meter"
+                            max="1"
+                            value="0"
+                            aria-label="Team volume"
+                        ></progress>
+                    </div>
+                </div>
+                <div class="game-stage">
+                    <canvas id="game-canvas" width="900" height="420"></canvas>
+                    <div id="qte-panel" class="qte-panel hidden">
+                        <span class="qte-label">Quick challenge</span>
+                        <strong id="qte-prompt"></strong>
+                        <progress
+                            id="qte-progress"
+                            max="60"
+                            value="0"
+                        ></progress>
+                    </div>
+                    <div id="game-over-panel" class="game-over-panel hidden">
+                        <span class="game-over-label">Run over</span>
+                        <strong><span id="final-score">0</span> pts</strong>
+                        <p id="game-over-reason"></p>
+                    </div>
+                </div>
                 <button id="restart-button" class="hidden" type="button">
                     Restart Run
                 </button>
@@ -372,6 +467,7 @@
             <p id="status"></p>
         </main>
         <script src="https://cdn.jsdelivr.net/npm/@cloudflare/realtimekit@latest/dist/browser.js"></script>
+        <script src="/gameRenderer.js"></script>
         <script src="/app.js"></script>
     </body>
 </html>
