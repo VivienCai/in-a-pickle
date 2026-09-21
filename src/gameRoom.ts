@@ -1,10 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
 import { addParticipant, createMeeting } from "./realtimeKit";
 import {
+  getQteControlPlayerIds,
+  getQteSafetyEndX,
+  getRunSpeed,
   hitsCeilingSpikes,
+  hitsObstacle,
   isQteSuccess,
+  isQtePathClear,
   isQteVolumeInTarget,
-  PICKLE_HEIGHT,
   QTE_DURATION_TICKS,
   QTE_FIRST_TICK,
   QTE_INTERVAL_TICKS,
@@ -18,8 +22,10 @@ import type {
   LiveGameState,
   Obstacle,
   Player,
+  RunAwards,
   RoomState,
   ServerMessage,
+  VoiceQte,
 } from "./types";
 
 interface Env {
@@ -39,16 +45,30 @@ interface StoredPlayer {
   connected: number;
   last_seen_at: number;
   recording_ready: number;
+  briefing_ready: number;
+  clips_uploaded_at: number;
   clip_uid: string | null;
   clip_url: string | null;
+  start_clip_uid: string | null;
+  start_clip_url: string | null;
+  coin_clip_uid: string | null;
+  coin_clip_url: string | null;
   triumph_clip_uid: string | null;
   triumph_clip_url: string | null;
 }
 
+type SoundStage = "death" | "start" | "coin";
+
+const SOUND_COLUMNS = {
+  death: { uid: "clip_uid", url: "clip_url" },
+  start: { uid: "start_clip_uid", url: "start_clip_url" },
+  coin: { uid: "coin_clip_uid", url: "coin_clip_url" },
+} as const;
+
 interface RoomRow {
   code: string;
   status: RoomState["status"];
-  recording_stage: "death" | "triumph" | null;
+  recording_stage: "sounds" | null;
   final_score: number | null;
   game_over_reason: string | null;
 }
@@ -58,14 +78,15 @@ interface MeetingRow {
 }
 
 const RECONNECT_GRACE_MS = 5 * 60 * 1000;
-const RUN_SPEED = 145;
 const SPEAKING_VOLUME_THRESHOLD = 0.15;
 const PROCESSING_RETRY_MS = 70 * 1000;
+const PROCESSING_TIMEOUT_MS = 3 * 60 * 1000;
 
 export class GameRoom extends DurableObject<Env> {
   private readonly sockets = new Map<WebSocket, string>();
   private readonly micReady = new Set<string>();
   private readonly playerVolumes = new Map<string, { volume: number; lastReportedAt: number }>();
+  private readonly runVoiceStats = new Map<string, { totalVolume: number; samples: number }>();
   private game: LiveGameState | null = null;
   private gameLoop: ReturnType<typeof setInterval> | null = null;
   private lastLobbyVoiceBroadcastAt = 0;
@@ -93,11 +114,22 @@ export class GameRoom extends DurableObject<Env> {
         last_seen_at INTEGER NOT NULL DEFAULT 0
       )
     `);
+    this.ctx.storage.sql.exec(`
+      CREATE TABLE IF NOT EXISTS clip_cleanup (
+        uid TEXT PRIMARY KEY
+      )
+    `);
     this.ensurePlayerColumn("connected", "INTEGER NOT NULL DEFAULT 0");
     this.ensurePlayerColumn("last_seen_at", "INTEGER NOT NULL DEFAULT 0");
     this.ensurePlayerColumn("recording_ready", "INTEGER NOT NULL DEFAULT 0");
+    this.ensurePlayerColumn("briefing_ready", "INTEGER NOT NULL DEFAULT 0");
+    this.ensurePlayerColumn("clips_uploaded_at", "INTEGER NOT NULL DEFAULT 0");
     this.ensurePlayerColumn("clip_uid", "TEXT");
     this.ensurePlayerColumn("clip_url", "TEXT");
+    this.ensurePlayerColumn("start_clip_uid", "TEXT");
+    this.ensurePlayerColumn("start_clip_url", "TEXT");
+    this.ensurePlayerColumn("coin_clip_uid", "TEXT");
+    this.ensurePlayerColumn("coin_clip_url", "TEXT");
     this.ensurePlayerColumn("triumph_clip_uid", "TEXT");
     this.ensurePlayerColumn("triumph_clip_url", "TEXT");
     this.ensureRoomColumn("meeting_id", "TEXT");
@@ -264,6 +296,15 @@ export class GameRoom extends DurableObject<Env> {
     try {
       const message = JSON.parse(rawMessage) as ClientMessage;
       if (message.type === "ping") {
+        const playerId = this.sockets.get(socket);
+        if (playerId) {
+          this.ctx.storage.sql.exec(
+            "UPDATE players SET connected = 1, last_seen_at = ? WHERE id = ?",
+            Date.now(),
+            playerId,
+          );
+          this.scheduleNextAlarm();
+        }
         this.send(socket, { type: "pong" });
       } else if (message.type === "getState") {
         this.sendState(socket);
@@ -271,6 +312,8 @@ export class GameRoom extends DurableObject<Env> {
         this.startGame(socket);
       } else if (message.type === "restartGame") {
         this.restartGame(socket);
+      } else if (message.type === "briefingReady") {
+        this.markBriefingReady(socket);
       } else if (message.type === "micReady") {
         this.markMicReady(socket);
       } else if (message.type === "micNotReady") {
@@ -285,7 +328,12 @@ export class GameRoom extends DurableObject<Env> {
 
   private getState(): RoomState {
     const roomRows = this.ctx.storage.sql.exec("SELECT code, status, recording_stage, final_score, game_over_reason FROM rooms LIMIT 1").toArray() as unknown as RoomRow[];
-    const playerRows = this.ctx.storage.sql.exec("SELECT id, name, is_host, connected, last_seen_at, recording_ready, clip_uid, clip_url, triumph_clip_uid, triumph_clip_url FROM players WHERE connected = 1 ORDER BY joined_at").toArray() as unknown as StoredPlayer[];
+    const playerRows = this.ctx.storage.sql.exec(
+      `SELECT id, name, is_host, connected, last_seen_at, recording_ready, briefing_ready,
+        clip_uid, clip_url, start_clip_uid, start_clip_url, coin_clip_uid, coin_clip_url,
+        triumph_clip_uid, triumph_clip_url
+       FROM players WHERE connected = 1 ORDER BY joined_at`,
+    ).toArray() as unknown as StoredPlayer[];
     const now = Date.now();
 
     return {
@@ -293,10 +341,9 @@ export class GameRoom extends DurableObject<Env> {
       status: roomRows[0]?.status ?? "lobby",
       recordingStage: roomRows[0]?.recording_stage ?? null,
       soundsReady: this.allPlayerClipsReady(),
-      stageSoundsReady: roomRows[0]?.recording_stage === "death" || roomRows[0]?.recording_stage === "triumph"
-        ? this.allStageClipsReady(roomRows[0].recording_stage)
-        : false,
+      stageSoundsReady: this.allPlayerClipsReady(),
       recordingsSubmitted: this.allPlayersReady(),
+      briefingComplete: this.allPlayersBriefingReady(),
       hasDisconnectedPlayers: this.hasDisconnectedPlayers(),
       players: playerRows.map((player): Player => ({
         id: player.id,
@@ -305,8 +352,10 @@ export class GameRoom extends DurableObject<Env> {
         micReady: this.micReady.has(player.id),
         speaking: this.isSpeaking(player.id, now),
         recordingReady: player.recording_ready === 1,
+        briefingReady: player.briefing_ready === 1,
         hasDeathClip: Boolean(player.clip_url),
-        hasTriumphClip: Boolean(player.triumph_clip_url),
+        hasStartClip: Boolean(player.start_clip_url),
+        hasCoinClip: Boolean(player.coin_clip_url),
       })),
     };
   }
@@ -320,13 +369,13 @@ export class GameRoom extends DurableObject<Env> {
     }
 
     const rows = this.ctx.storage.sql.exec(
-      "SELECT connected, last_seen_at FROM players WHERE id = ? AND room_code = ?",
+      "SELECT last_seen_at FROM players WHERE id = ? AND room_code = ?",
       playerId,
       roomCode,
-    ).toArray() as unknown as Array<{ connected: number; last_seen_at: number }>;
+    ).toArray() as unknown as Array<{ last_seen_at: number }>;
     const player = rows[0];
     const canRejoin = Boolean(
-      player && (player.connected === 1 || Date.now() - player.last_seen_at <= RECONNECT_GRACE_MS),
+      player && Date.now() - player.last_seen_at <= RECONNECT_GRACE_MS,
     );
     return Response.json({ canRejoin });
   }
@@ -364,7 +413,6 @@ export class GameRoom extends DurableObject<Env> {
     const url = new URL(request.url);
     const roomCode = url.searchParams.get("roomCode")?.toUpperCase();
     const playerId = url.searchParams.get("playerId");
-    const requestedStage = url.searchParams.get("stage");
     if (!roomCode || !playerId || !this.playerExists(roomCode, playerId)) {
       return Response.json({ error: "Invalid room or player." }, { status: 401 });
     }
@@ -374,61 +422,85 @@ export class GameRoom extends DurableObject<Env> {
       return Response.json({ error: "Sound recording is not open right now." }, { status: 409 });
     }
 
-    const clip = await request.blob();
-    if (clip.size === 0 || clip.size > 1024 * 1024) {
-      return Response.json({ error: "Sound clips must be between 1 byte and 1 MB." }, { status: 413 });
+    const form = await request.formData();
+    const clips = ["death", "start", "coin"].map((stage) => ({
+      stage: stage as SoundStage,
+      clip: form.get(stage),
+    }));
+    if (clips.some(({ clip }) => !(clip instanceof File))) {
+      return Response.json({ error: "Death, start, and coin recordings are required." }, { status: 400 });
+    }
+    if (clips.some(({ clip }) => clip instanceof File && (clip.size === 0 || clip.size > 1024 * 1024))) {
+      return Response.json({ error: "Each sound must be between 1 byte and 1 MB." }, { status: 413 });
     }
 
-    const roomRows = this.ctx.storage.sql.exec(
-      "SELECT recording_stage FROM rooms WHERE code = ?", roomCode,
-    ).toArray() as unknown as Array<{ recording_stage: "death" | "triumph" | null }>;
-    const stage = roomRows[0]?.recording_stage;
-    if (
-      (stage !== "death" && stage !== "triumph") ||
-      requestedStage !== stage
-    ) {
-      return Response.json({ error: "Sound recording is not open right now." }, { status: 409 });
-    }
-
-    const uploaded = await uploadClip(this.env, clip);
-    if (!uploaded.ok) {
-      const tokenHelp = /auth|permission/i.test(uploaded.error)
+    const uploads = await Promise.all(clips.map(({ clip }) => uploadClip(this.env, clip as File)));
+    const failedUpload = uploads.find((result) => !result.ok);
+    if (failedUpload && !failedUpload.ok) {
+      await this.cleanupClipUids(uploads.flatMap((result) => result.ok ? [result.uid] : []));
+      const tokenHelp = /auth|permission/i.test(failedUpload.error)
         ? " Give the API token Account > Stream > Edit permission, then restart Wrangler."
         : "";
-      return Response.json({ error: `Could not upload that sound clip: ${uploaded.error}${tokenHelp}` }, { status: 502 });
+      return Response.json({ error: `Could not upload those sounds: ${failedUpload.error}${tokenHelp}` }, { status: 502 });
     }
+    const uploadedUids = uploads.map((result) => {
+      if (!result.ok) {
+        throw new Error(result.error);
+      }
+      return result.uid;
+    });
 
     const currentRoom = this.ctx.storage.sql.exec(
-      "SELECT status, recording_stage FROM rooms WHERE code = ?",
+      "SELECT status FROM rooms WHERE code = ?",
       roomCode,
-    ).toArray() as unknown as Array<{ status: RoomState["status"]; recording_stage: "death" | "triumph" | null }>;
+    ).toArray() as unknown as Array<{ status: RoomState["status"] }>;
     if (
       currentRoom[0]?.status !== "recording" ||
-      currentRoom[0]?.recording_stage !== stage ||
       !this.playerExists(roomCode, playerId)
     ) {
-      await deleteClip(this.env, uploaded.uid);
+      await this.cleanupClipUids(uploadedUids);
       return Response.json({ error: "The recording round changed while that clip was uploading." }, { status: 409 });
     }
 
-    const uidColumn = stage === "death" ? "clip_uid" : "triumph_clip_uid";
-    const urlColumn = stage === "death" ? "clip_url" : "triumph_clip_url";
     const existing = this.ctx.storage.sql
-      .exec(`SELECT ${uidColumn} AS clip_uid FROM players WHERE id = ? AND room_code = ?`, playerId, roomCode)
-      .toArray() as unknown as Array<{ clip_uid: string | null }>;
-    const previousUid = existing[0]?.clip_uid;
+      .exec(
+        `SELECT clip_uid, start_clip_uid, coin_clip_uid FROM players
+         WHERE id = ? AND room_code = ?`,
+        playerId,
+        roomCode,
+      )
+      .toArray() as unknown as Array<{
+        clip_uid: string | null;
+        start_clip_uid: string | null;
+        coin_clip_uid: string | null;
+      }>;
+    const previousUids = existing[0]
+      ? [existing[0].clip_uid, existing[0].start_clip_uid, existing[0].coin_clip_uid]
+      : [];
     this.ctx.storage.sql.exec(
-      `UPDATE players SET ${uidColumn} = ?, ${urlColumn} = ?, recording_ready = 1 WHERE id = ? AND room_code = ?`,
-      uploaded.uid,
-      null,
+      `UPDATE players SET
+        clip_uid = ?, clip_url = NULL,
+        start_clip_uid = ?, start_clip_url = NULL,
+        coin_clip_uid = ?, coin_clip_url = NULL,
+        recording_ready = 1, clips_uploaded_at = ?
+       WHERE id = ? AND room_code = ?`,
+      uploadedUids[0],
+      uploadedUids[1],
+      uploadedUids[2],
+      Date.now(),
       playerId,
       roomCode,
     );
-    if (previousUid && previousUid !== uploaded.uid) {
-      this.ctx.waitUntil(deleteClip(this.env, previousUid));
+    const oldUids = previousUids.filter(
+      (uid): uid is string => Boolean(uid && !uploadedUids.includes(uid)),
+    );
+    if (oldUids.length > 0) {
+      this.ctx.waitUntil(this.cleanupClipUids(oldUids));
     }
 
-    this.ctx.waitUntil(this.preparePlayerClip(roomCode, playerId, stage, uploaded.uid));
+    this.ctx.waitUntil(Promise.all(
+      clips.map(({ stage }, index) => this.preparePlayerClip(roomCode, playerId, stage, uploadedUids[index])),
+    ).then(() => undefined));
     this.scheduleNextAlarm();
 
     this.broadcastState();
@@ -439,26 +511,32 @@ export class GameRoom extends DurableObject<Env> {
   private async preparePlayerClip(
     roomCode: string,
     playerId: string,
-    stage: "death" | "triumph",
+    stage: SoundStage,
     uid: string,
   ): Promise<void> {
     const result = await prepareClipAudio(this.env, uid);
-    const uidColumn = stage === "death" ? "clip_uid" : "triumph_clip_uid";
-    const urlColumn = stage === "death" ? "clip_url" : "triumph_clip_url";
+    const { uid: uidColumn, url: urlColumn } = SOUND_COLUMNS[stage];
     const current = this.ctx.storage.sql
-      .exec(`SELECT ${uidColumn} AS clip_uid FROM players WHERE id = ? AND room_code = ?`, playerId, roomCode)
-      .toArray() as unknown as Array<{ clip_uid: string | null }>;
+      .exec(
+        `SELECT ${uidColumn} AS clip_uid, clips_uploaded_at FROM players WHERE id = ? AND room_code = ?`,
+        playerId,
+        roomCode,
+      )
+      .toArray() as unknown as Array<{ clip_uid: string | null; clips_uploaded_at: number }>;
     if (current[0]?.clip_uid !== uid) {
-      await deleteClip(this.env, uid);
+      await this.cleanupClipUids([uid]);
       return;
     }
 
     if (!result.ok) {
-      if (result.retryable) {
+      const processingTimedOut = result.retryable && (
+        !current[0]?.clips_uploaded_at || Date.now() - current[0].clips_uploaded_at >= PROCESSING_TIMEOUT_MS
+      );
+      if (result.retryable && !processingTimedOut) {
         this.scheduleNextAlarm(10_000);
         return;
       }
-      await deleteClip(this.env, uid);
+      await this.cleanupClipUids([uid]);
       this.ctx.storage.sql.exec(
         `UPDATE players SET ${uidColumn} = NULL, ${urlColumn} = NULL, recording_ready = 0 WHERE id = ? AND room_code = ?`,
         playerId,
@@ -466,7 +544,13 @@ export class GameRoom extends DurableObject<Env> {
       );
       for (const [socket, socketPlayerId] of this.sockets) {
         if (socketPlayerId === playerId) {
-          this.send(socket, { type: "error", message: result.error });
+          this.send(socket, {
+            type: "error",
+            message: processingTimedOut
+              ? `Stream got stuck processing your ${stage} sound. Please record your three sounds again.`
+              : result.error,
+            resetRecordings: true,
+          });
         }
       }
       this.broadcastState();
@@ -482,7 +566,6 @@ export class GameRoom extends DurableObject<Env> {
       uid,
     );
     this.broadcastState();
-    this.advanceRecordingIfReady();
     this.scheduleNextAlarm();
   }
 
@@ -504,22 +587,35 @@ export class GameRoom extends DurableObject<Env> {
   async alarm(): Promise<void> {
     const cutoff = Date.now() - RECONNECT_GRACE_MS;
     const expired = this.ctx.storage.sql.exec(
-      `SELECT id, clip_uid, triumph_clip_uid
-       FROM players WHERE connected = 0 AND last_seen_at <= ?`,
+      `SELECT id, clip_uid, start_clip_uid, coin_clip_uid, triumph_clip_uid
+       FROM players WHERE last_seen_at <= ?`,
       cutoff,
     ).toArray() as unknown as Array<{
       id: string;
       clip_uid: string | null;
+      start_clip_uid: string | null;
+      coin_clip_uid: string | null;
       triumph_clip_uid: string | null;
     }>;
+    const expiredUids = expired.flatMap((player) => [
+      player.clip_uid,
+      player.start_clip_uid,
+      player.coin_clip_uid,
+      player.triumph_clip_uid,
+    ]);
+    this.queueClipCleanup(expiredUids);
     this.ctx.storage.sql.exec(
-      "DELETE FROM players WHERE connected = 0 AND last_seen_at <= ?",
+      "DELETE FROM players WHERE last_seen_at <= ?",
       cutoff,
     );
-    await Promise.all(expired
-      .flatMap((player) => [player.clip_uid, player.triumph_clip_uid])
-      .filter((uid): uid is string => uid !== null)
-      .map((uid) => deleteClip(this.env, uid)));
+    const expiredPlayerIds = new Set(expired.map((player) => player.id));
+    for (const [socket, playerId] of this.sockets) {
+      if (expiredPlayerIds.has(playerId)) {
+        this.sockets.delete(socket);
+        socket.close(1000, "Rejoin window expired");
+      }
+    }
+    await this.processClipCleanup();
 
     if (this.totalPlayerCount() === 0) {
       await this.closeRoom();
@@ -534,7 +630,6 @@ export class GameRoom extends DurableObject<Env> {
       clip.stage,
       clip.uid,
     )));
-    this.advanceRecordingIfReady();
     this.scheduleNextAlarm(10_000);
   }
 
@@ -586,6 +681,7 @@ export class GameRoom extends DurableObject<Env> {
       levelSeed: 1,
       obstacles: [],
       gameOverReason: reason,
+      awards: { loudestPlayer: null, quietestPlayer: null },
       qte: null,
       qteResult: null,
       nextQteTick: QTE_FIRST_TICK,
@@ -595,40 +691,73 @@ export class GameRoom extends DurableObject<Env> {
   private pendingClips(): Array<{
     roomCode: string;
     playerId: string;
-    stage: "death" | "triumph";
+    stage: SoundStage;
     uid: string;
   }> {
     const rows = this.ctx.storage.sql.exec(
-      `SELECT id, room_code, clip_uid, clip_url, triumph_clip_uid, triumph_clip_url
+      `SELECT id, room_code, clip_uid, clip_url,
+        start_clip_uid, start_clip_url, coin_clip_uid, coin_clip_url
        FROM players`,
     ).toArray() as unknown as StoredPlayer[];
     return rows.flatMap((player) => {
       const pending: Array<{
         roomCode: string;
         playerId: string;
-        stage: "death" | "triumph";
+        stage: SoundStage;
         uid: string;
       }> = [];
       if (player.clip_uid && !player.clip_url) {
         pending.push({ roomCode: player.room_code, playerId: player.id, stage: "death", uid: player.clip_uid });
       }
-      if (player.triumph_clip_uid && !player.triumph_clip_url) {
-        pending.push({ roomCode: player.room_code, playerId: player.id, stage: "triumph", uid: player.triumph_clip_uid });
+      if (player.start_clip_uid && !player.start_clip_url) {
+        pending.push({ roomCode: player.room_code, playerId: player.id, stage: "start", uid: player.start_clip_uid });
+      }
+      if (player.coin_clip_uid && !player.coin_clip_url) {
+        pending.push({ roomCode: player.room_code, playerId: player.id, stage: "coin", uid: player.coin_clip_uid });
       }
       return pending;
     });
   }
 
+  private queueClipCleanup(uids: Array<string | null | undefined>): void {
+    for (const uid of new Set(uids.filter((value): value is string => Boolean(value)))) {
+      this.ctx.storage.sql.exec("INSERT OR IGNORE INTO clip_cleanup (uid) VALUES (?)", uid);
+    }
+  }
+
+  private async processClipCleanup(): Promise<void> {
+    const rows = this.ctx.storage.sql.exec("SELECT uid FROM clip_cleanup").toArray() as unknown as Array<{ uid: string }>;
+    const results = await Promise.all(rows.map(async ({ uid }) => ({
+      uid,
+      deleted: await deleteClip(this.env, uid),
+    })));
+    for (const result of results) {
+      if (result.deleted) {
+        this.ctx.storage.sql.exec("DELETE FROM clip_cleanup WHERE uid = ?", result.uid);
+      }
+    }
+  }
+
+  private async cleanupClipUids(uids: Array<string | null | undefined>): Promise<void> {
+    this.queueClipCleanup(uids);
+    await this.processClipCleanup();
+    this.scheduleNextAlarm();
+  }
+
   private scheduleNextAlarm(pendingDelayMs = PROCESSING_RETRY_MS): void {
     const deadlines: number[] = [];
-    const disconnected = this.ctx.storage.sql.exec(
-      "SELECT MIN(last_seen_at) AS last_seen_at FROM players WHERE connected = 0",
+    const players = this.ctx.storage.sql.exec(
+      "SELECT MIN(last_seen_at) AS last_seen_at FROM players",
     ).toArray() as unknown as Array<{ last_seen_at: number | null }>;
-    const lastSeenAt = disconnected[0]?.last_seen_at;
+    const lastSeenAt = players[0]?.last_seen_at;
     if (lastSeenAt !== null && lastSeenAt !== undefined) {
       deadlines.push(lastSeenAt + RECONNECT_GRACE_MS);
     }
     if (this.pendingClips().length > 0) {
+      deadlines.push(Date.now() + pendingDelayMs);
+    }
+    const cleanupPending = this.ctx.storage.sql.exec("SELECT 1 FROM clip_cleanup LIMIT 1").toArray().length > 0;
+    if (cleanupPending) {
       deadlines.push(Date.now() + pendingDelayMs);
     }
 
@@ -666,40 +795,33 @@ export class GameRoom extends DurableObject<Env> {
     return total > 0 && (rows[0]?.ready ?? 0) === total;
   }
 
+  private allPlayersBriefingReady(): boolean {
+    const rows = this.ctx.storage.sql.exec(
+      "SELECT COUNT(*) AS total, SUM(briefing_ready) AS ready FROM players",
+    ).toArray() as unknown as Array<{ total: number; ready: number | null }>;
+    const total = rows[0]?.total ?? 0;
+    return total > 0 && (rows[0]?.ready ?? 0) === total;
+  }
+
+  private markBriefingReady(socket: WebSocket): void {
+    const playerId = this.sockets.get(socket);
+    const room = this.getState();
+    if (!playerId || room.status !== "briefing") {
+      return;
+    }
+
+    this.ctx.storage.sql.exec("UPDATE players SET briefing_ready = 1 WHERE id = ?", playerId);
+    this.broadcastState();
+  }
+
   private allPlayerClipsReady(): boolean {
     const rows = this.ctx.storage.sql.exec(
       `SELECT COUNT(*) AS total,
-        SUM(CASE WHEN clip_url IS NOT NULL AND triumph_clip_url IS NOT NULL THEN 1 ELSE 0 END) AS ready
+        SUM(CASE WHEN clip_url IS NOT NULL AND start_clip_url IS NOT NULL AND coin_clip_url IS NOT NULL THEN 1 ELSE 0 END) AS ready
        FROM players`,
     ).toArray() as unknown as Array<{ total: number; ready: number | null }>;
     const total = rows[0]?.total ?? 0;
     return total > 0 && (rows[0]?.ready ?? 0) === total;
-  }
-
-  private allStageClipsReady(stage: "death" | "triumph"): boolean {
-    const column = stage === "death" ? "clip_url" : "triumph_clip_url";
-    const rows = this.ctx.storage.sql.exec(
-      `SELECT COUNT(*) AS total, SUM(CASE WHEN ${column} IS NOT NULL THEN 1 ELSE 0 END) AS ready FROM players`,
-    ).toArray() as unknown as Array<{ total: number; ready: number | null }>;
-    const total = rows[0]?.total ?? 0;
-    return total > 0 && (rows[0]?.ready ?? 0) === total;
-  }
-
-  private advanceRecordingIfReady(): void {
-    const state = this.getState();
-    if (state.status !== "recording" || state.hasDisconnectedPlayers) {
-      return;
-    }
-
-    if (state.recordingStage === "death" && this.allStageClipsReady("death")) {
-      this.ctx.storage.sql.exec("UPDATE rooms SET recording_stage = 'triumph'");
-      this.ctx.storage.sql.exec(
-        "UPDATE players SET recording_ready = CASE WHEN triumph_clip_uid IS NOT NULL THEN 1 ELSE 0 END",
-      );
-      this.broadcastState();
-      return;
-    }
-
   }
 
   private async closeRoom(): Promise<void> {
@@ -708,14 +830,25 @@ export class GameRoom extends DurableObject<Env> {
       this.gameLoop = null;
     }
     this.game = null;
-    const clips = this.ctx.storage.sql.exec("SELECT clip_uid, triumph_clip_uid FROM players").toArray() as unknown as Array<{ clip_uid: string | null; triumph_clip_uid: string | null }>;
+    const clips = this.ctx.storage.sql.exec(
+      "SELECT clip_uid, start_clip_uid, coin_clip_uid, triumph_clip_uid FROM players",
+    ).toArray() as unknown as Array<{
+      clip_uid: string | null;
+      start_clip_uid: string | null;
+      coin_clip_uid: string | null;
+      triumph_clip_uid: string | null;
+    }>;
+    const clipIds = clips.flatMap((clip) => [
+      clip.clip_uid,
+      clip.start_clip_uid,
+      clip.coin_clip_uid,
+      clip.triumph_clip_uid,
+    ]);
+    this.queueClipCleanup(clipIds);
     this.ctx.storage.sql.exec("DELETE FROM players");
     this.ctx.storage.sql.exec("DELETE FROM rooms");
-    this.ctx.storage.deleteAlarm();
-    const clipIds = clips
-      .flatMap((clip) => [clip.clip_uid, clip.triumph_clip_uid])
-      .filter((uid): uid is string => uid !== null);
-    await Promise.all(clipIds.map((uid) => deleteClip(this.env, uid)));
+    await this.processClipCleanup();
+    this.scheduleNextAlarm(10_000);
   }
 
   private disconnectPlayer(socket: WebSocket): void {
@@ -738,7 +871,6 @@ export class GameRoom extends DurableObject<Env> {
     this.reassignHostIfNeeded(playerId);
     this.scheduleNextAlarm();
     this.broadcastState();
-    this.advanceRecordingIfReady();
   }
 
   private startGame(socket: WebSocket): void {
@@ -755,11 +887,22 @@ export class GameRoom extends DurableObject<Env> {
     }
     if (room.status === "recording") {
       if (
-        room.recordingStage !== "triumph" ||
         !this.allPlayersReady() ||
         !this.allPlayerClipsReady()
       ) {
         this.send(socket, { type: "error", message: "Everyone's sounds must finish processing first." });
+        return;
+      }
+
+      this.ctx.storage.sql.exec("UPDATE rooms SET status = 'briefing', recording_stage = NULL");
+      this.ctx.storage.sql.exec("UPDATE players SET briefing_ready = 0");
+      this.broadcastState();
+      return;
+    }
+
+    if (room.status === "briefing") {
+      if (!this.allPlayersBriefingReady()) {
+        this.send(socket, { type: "error", message: "Everyone must ready up before the run starts." });
         return;
       }
 
@@ -772,8 +915,8 @@ export class GameRoom extends DurableObject<Env> {
       return;
     }
 
-    this.ctx.storage.sql.exec("UPDATE rooms SET status = 'recording', recording_stage = 'death'");
-    this.ctx.storage.sql.exec("UPDATE players SET recording_ready = 0");
+    this.ctx.storage.sql.exec("UPDATE rooms SET status = 'recording', recording_stage = 'sounds'");
+    this.ctx.storage.sql.exec("UPDATE players SET recording_ready = 0, briefing_ready = 0");
     this.broadcastState();
   }
 
@@ -795,6 +938,7 @@ export class GameRoom extends DurableObject<Env> {
 
   private beginGame(seed: number): void {
     this.randomState = seed;
+    this.runVoiceStats.clear();
     this.nextObstacleX = 650;
     this.nextObstacleId = 1;
     this.game = {
@@ -809,6 +953,7 @@ export class GameRoom extends DurableObject<Env> {
       levelSeed: this.randomState,
       obstacles: [],
       gameOverReason: null,
+      awards: { loudestPlayer: null, quietestPlayer: null },
       qte: null,
       qteResult: null,
       nextQteTick: QTE_FIRST_TICK,
@@ -819,7 +964,7 @@ export class GameRoom extends DurableObject<Env> {
     this.spawnObstacles();
     this.startGameLoop();
     this.broadcastState();
-    this.broadcastRandomClip("triumph");
+    this.broadcastRandomClip("start");
   }
 
   private reportVolume(socket: WebSocket, volume: number): void {
@@ -829,10 +974,17 @@ export class GameRoom extends DurableObject<Env> {
     }
 
     const now = Date.now();
+    const normalizedVolume = Math.max(0, Math.min(1, volume));
     this.playerVolumes.set(playerId, {
-      volume: Math.max(0, Math.min(1, volume)),
+      volume: normalizedVolume,
       lastReportedAt: now,
     });
+    if (this.game && !this.game.gameOverReason) {
+      const stats = this.runVoiceStats.get(playerId) ?? { totalVolume: 0, samples: 0 };
+      stats.totalVolume += normalizedVolume;
+      stats.samples += 1;
+      this.runVoiceStats.set(playerId, stats);
+    }
 
     if ((!this.game || this.game.gameOverReason) && now - this.lastLobbyVoiceBroadcastAt >= 100) {
       this.lastLobbyVoiceBroadcastAt = now;
@@ -875,9 +1027,10 @@ export class GameRoom extends DurableObject<Env> {
 
     const now = Date.now();
     const connectedPlayerIds = [...new Set(this.sockets.values())];
+    const controlPlayerIds = getQteControlPlayerIds(this.game.qte, connectedPlayerIds);
     let totalVolume = 0;
     let freshReportCount = 0;
-    for (const playerId of connectedPlayerIds) {
+    for (const playerId of controlPlayerIds) {
       const report = this.playerVolumes.get(playerId);
       if (report && now - report.lastReportedAt <= 500) {
         totalVolume += report.volume;
@@ -887,16 +1040,17 @@ export class GameRoom extends DurableObject<Env> {
 
     const deltaSeconds = TICK_MS / 1000;
     const character = this.game.character;
-    const averageVolume = connectedPlayerIds.length > 0
-      ? totalVolume / connectedPlayerIds.length
+    const averageVolume = controlPlayerIds.length > 0
+      ? totalVolume / controlPlayerIds.length
       : 0;
     this.game.averageVolume += (averageVolume - this.game.averageVolume) * 0.18;
     character.y = Math.max(0, Math.min(WORLD_HEIGHT, this.game.averageVolume * WORLD_HEIGHT));
 
-    character.x += RUN_SPEED * deltaSeconds;
+    const runSpeed = getRunSpeed(this.game.tick);
+    character.x += runSpeed * deltaSeconds;
     this.game.score = Math.floor(character.x / 10);
     this.game.tick += 1;
-    this.tickVoiceQte(freshReportCount);
+    this.tickVoiceQte(freshReportCount, connectedPlayerIds);
     this.spawnObstacles();
 
     this.game.obstacles = this.game.obstacles.filter(
@@ -912,11 +1066,10 @@ export class GameRoom extends DurableObject<Env> {
     const pickleRight = character.x + 32;
     for (const obstacle of this.game.obstacles) {
       const overlapsX = pickleRight > obstacle.x && pickleLeft < obstacle.x + obstacle.width;
-      const hitsObstacle = obstacle.fromTop
-        ? character.y + PICKLE_HEIGHT > WORLD_HEIGHT - obstacle.height
-        : character.y < obstacle.height;
-      if (overlapsX && hitsObstacle) {
-        this.endGame("The pickle hit a kitchen obstacle.");
+      if (overlapsX && hitsObstacle(character.y, obstacle)) {
+        this.endGame(obstacle.kind === "utensil"
+          ? "The pickle got smacked by a flying utensil."
+          : "The pickle hit a kitchen obstacle.");
         return;
       }
     }
@@ -924,7 +1077,7 @@ export class GameRoom extends DurableObject<Env> {
     this.broadcastState();
   }
 
-  private tickVoiceQte(freshReportCount: number): void {
+  private tickVoiceQte(freshReportCount: number, connectedPlayerIds: string[]): void {
     if (!this.game) {
       return;
     }
@@ -937,10 +1090,35 @@ export class GameRoom extends DurableObject<Env> {
     }
 
     if (!this.game.qte && this.game.tick >= this.game.nextQteTick) {
-      const type = this.nextRandom() < 0.5 ? "quiet" : "steady";
+      const safetyEndX = getQteSafetyEndX(this.game.character.x, getRunSpeed(this.game.tick));
+      if (!isQtePathClear(this.game.obstacles, this.game.character.x, safetyEndX)) {
+        return;
+      }
+
+      const roll = this.nextRandom();
+      const type: VoiceQte["type"] = roll < 1 / 3
+        ? "quiet"
+        : roll < 2 / 3 || connectedPlayerIds.length === 0
+          ? "steady"
+          : "solo";
+      const targetPlayerId = type === "solo"
+        ? connectedPlayerIds[Math.floor(this.nextRandom() * connectedPlayerIds.length)]
+        : null;
+      const targetPlayerName = targetPlayerId
+        ? (this.ctx.storage.sql.exec<{ name: string }>(
+            "SELECT name FROM players WHERE id = ?",
+            targetPlayerId,
+          ).one().name)
+        : null;
       this.game.qte = {
         type,
-        prompt: type === "quiet" ? "Shhh! Keep the team quiet" : "Hold a steady medium volume",
+        prompt: type === "quiet"
+          ? "Shhh! Keep the team quiet"
+          : type === "steady"
+            ? "Hold a steady medium volume"
+            : `${targetPlayerName}, take the wheel! Only your voice controls the pickle`,
+        targetPlayerId,
+        targetPlayerName,
         remainingTicks: QTE_DURATION_TICKS,
         totalTicks: QTE_DURATION_TICKS,
         successfulTicks: 0,
@@ -955,7 +1133,9 @@ export class GameRoom extends DurableObject<Env> {
     }
 
     const volume = this.game.averageVolume;
-    const inTarget = freshReportCount > 0 && isQteVolumeInTarget(qte.type, volume);
+    const inTarget = qte.type === "solo"
+      ? freshReportCount > 0
+      : freshReportCount > 0 && isQteVolumeInTarget(qte.type, volume);
     if (inTarget) {
       qte.successfulTicks += 1;
     }
@@ -965,11 +1145,15 @@ export class GameRoom extends DurableObject<Env> {
       const success = isQteSuccess(qte.successfulTicks, qte.totalTicks);
       if (success) {
         this.game.coins += 1;
-        this.broadcastRandomClip("triumph");
+        this.broadcastRandomClip("coin");
       }
       this.game.qteResult = {
         success,
-        message: success ? "+1 coin! Nice teamwork." : "Missed it. Keep running!",
+        message: success
+          ? qte.type === "solo"
+            ? `+1 coin! ${qte.targetPlayerName} handled the solo.`
+            : "+1 coin! Nice teamwork."
+          : "Missed it. Keep running!",
         remainingTicks: QTE_RESULT_TICKS,
       };
       this.game.qte = null;
@@ -982,12 +1166,14 @@ export class GameRoom extends DurableObject<Env> {
     }
 
     while (this.nextObstacleX < this.game.character.x + 1000) {
+      const isUtensil = this.nextObstacleId % 2 === 0;
       const obstacle: Obstacle = {
         id: this.nextObstacleId,
+        kind: isUtensil ? "utensil" : "floor",
         x: this.nextObstacleX,
-        width: 30 + Math.floor(this.nextRandom() * 30),
-        height: 18 + Math.floor(this.nextRandom() * 38),
-        fromTop: this.nextObstacleId % 2 === 0,
+        y: isUtensil ? 145 + Math.floor(this.nextRandom() * 46) : 0,
+        width: isUtensil ? 118 + Math.floor(this.nextRandom() * 18) : 56 + Math.floor(this.nextRandom() * 20),
+        height: isUtensil ? 32 + Math.floor(this.nextRandom() * 7) : 48 + Math.floor(this.nextRandom() * 19),
       };
       this.nextObstacleId += 1;
       this.game.obstacles.push(obstacle);
@@ -1006,6 +1192,7 @@ export class GameRoom extends DurableObject<Env> {
     }
 
     this.game.gameOverReason = reason;
+    this.game.awards = this.calculateRunAwards();
     const finalScore = this.game.score;
     this.ctx.storage.sql.exec(
       "UPDATE rooms SET status = 'finished', final_score = ?, game_over_reason = ?",
@@ -1022,14 +1209,34 @@ export class GameRoom extends DurableObject<Env> {
     this.broadcastRandomClip("death");
   }
 
+  private calculateRunAwards(): RunAwards {
+    const playerNames = new Map(
+      this.ctx.storage.sql.exec<{ id: string; name: string }>("SELECT id, name FROM players")
+        .toArray()
+        .map((player) => [player.id, player.name]),
+    );
+    const averages = [...this.runVoiceStats.entries()]
+      .filter(([playerId, stats]) => stats.samples > 0 && playerNames.has(playerId))
+      .map(([playerId, stats]) => ({
+        name: playerNames.get(playerId)!,
+        average: stats.totalVolume / stats.samples,
+      }))
+      .sort((a, b) => a.average - b.average || a.name.localeCompare(b.name));
+
+    return {
+      loudestPlayer: averages.at(-1)?.name ?? null,
+      quietestPlayer: averages.length > 1 ? averages[0].name : null,
+    };
+  }
+
   private makeSeed(): number {
     const seedBytes = new Uint32Array(1);
     crypto.getRandomValues(seedBytes);
     return seedBytes[0] || 1;
   }
 
-  private broadcastRandomClip(stage: "death" | "triumph"): void {
-    const column = stage === "death" ? "clip_url" : "triumph_clip_url";
+  private broadcastRandomClip(stage: SoundStage): void {
+    const column = SOUND_COLUMNS[stage].url;
     const clips = this.ctx.storage.sql.exec(
       `SELECT ${column} AS clip_url FROM players WHERE connected = 1 AND ${column} IS NOT NULL`,
     ).toArray() as unknown as Array<{ clip_url: string }>;

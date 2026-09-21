@@ -65,7 +65,7 @@
                 width: 100%;
                 padding: 13px;
                 font: inherit;
-                border: 2px solid #1f3020;
+                border: 3px solid #1f3020;
                 border-radius: 5px;
             }
 
@@ -100,7 +100,7 @@
             .room {
                 padding: 16px;
                 background: #e3f0b9;
-                border: 2px dashed #4b842f;
+                border: 3px dashed #4b842f;
                 border-radius: 5px 10px 6px 8px;
             }
 
@@ -120,15 +120,21 @@
                 align-items: center;
                 justify-content: space-between;
                 gap: 12px;
-                padding: 9px 0;
-                border-bottom: 1px solid #c5d79a;
+                padding: 9px 8px;
+                border-left: 4px solid transparent;
+                border-bottom: 3px solid #c5d79a;
+                border-radius: 4px;
                 font-weight: 800;
+                transition:
+                    color 100ms ease,
+                    background 100ms ease,
+                    border-color 100ms ease;
             }
             .player-row.speaking {
-                padding-left: 8px;
-                color: #315f25;
-                background: #e7f3cf;
-                border-left: 4px solid #4b842f;
+                color: #244c1e;
+                background: #dcefb9;
+                border-left-color: #4b842f;
+                border-bottom-color: #9aae78;
             }
             .mic-status {
                 flex-shrink: 0;
@@ -156,10 +162,9 @@
                 background: #f0bd3d;
             }
             #rejoin-prompt {
-                margin-bottom: 22px;
                 padding: 16px;
                 background: #e3f0b9;
-                border: 2px dashed #4b842f;
+                border: 3px dashed #4b842f;
                 border-radius: 5px 10px 6px 8px;
             }
             #rejoin-prompt p {
@@ -176,7 +181,7 @@
                 margin-top: 18px;
                 padding: 14px;
                 background: #f2f5df;
-                border: 1px solid #c5d79a;
+                border: 3px solid #c5d79a;
                 border-radius: 5px;
             }
             .setup-label {
@@ -224,7 +229,7 @@
                 padding: 6px 10px;
                 color: #526141;
                 background: #f2f5df;
-                border: 2px solid #9aae78;
+                border: 3px solid #9aae78;
                 border-radius: 999px;
                 font-size: 0.8rem;
                 font-weight: 900;
@@ -236,7 +241,6 @@
                 color: #fff8df;
                 background: #4b842f;
                 border-color: #1f3020;
-                transform: scale(1.04);
             }
             .voice-connection {
                 margin: 10px 0 0;
@@ -280,6 +284,50 @@
             #recording-players {
                 margin-top: 20px;
                 text-align: left;
+            }
+            .briefing-panel {
+                margin: 18px 0;
+                padding: 18px;
+                text-align: left;
+                background: #f2f5df;
+                border: 3px solid #4b842f;
+                border-radius: 6px 11px 7px 9px;
+                box-shadow: 5px 5px 0 #c5d79a;
+            }
+            .briefing-panel h2,
+            .briefing-panel > p {
+                text-align: center;
+            }
+            .briefing-steps {
+                display: grid;
+                gap: 10px;
+                margin: 18px 0;
+                padding: 0;
+                list-style: none;
+                counter-reset: briefing-step;
+            }
+            .briefing-steps li {
+                display: grid;
+                grid-template-columns: 34px 1fr;
+                gap: 10px;
+                align-items: center;
+                counter-increment: briefing-step;
+                font-weight: 800;
+            }
+            .briefing-steps li::before {
+                display: grid;
+                width: 32px;
+                height: 32px;
+                place-items: center;
+                color: #fff8df;
+                background: #d8523b;
+                border-radius: 50%;
+                content: counter(briefing-step);
+                font-weight: 900;
+            }
+            #briefing-ready-button {
+                display: block;
+                width: 100%;
             }
             #start-button:disabled {
                 cursor: not-allowed;
@@ -350,7 +398,7 @@
                 <h2>Players</h2>
                 <ul id="players"></ul>
                 <button id="start-button" class="hidden" type="button">
-                    Record Sounds
+                    Let's Start!
                 </button>
                 <div class="mic-setup">
                     <div class="setup-label">
@@ -378,10 +426,10 @@
             </section>
 
             <section id="recording" class="hidden">
-                <h2 id="recording-title">Death Sound</h2>
+                <h2 id="recording-title">Recording Booth</h2>
                 <p id="recording-copy">
-                    Record the sound you'd make when you crash into a kitchen
-                    obstacle.
+                    What sound do you make when you stub your toe on a sharp
+                    corner?
                 </p>
                 <progress
                     id="recording-progress"
@@ -394,11 +442,34 @@
                 </button>
                 <audio id="clip-preview" class="hidden" controls></audio>
                 <button id="upload-clip-button" class="hidden" type="button">
-                    Use This Sound &amp; Ready Up
+                    Use This Sound
                 </button>
                 <button id="rerecord-button" class="hidden" type="button">
                     Rerecord
                 </button>
+                <div id="briefing-panel" class="briefing-panel hidden">
+                    <h2>Before You Run</h2>
+                    <p>Read this. Things get chaotic fast.</p>
+                    <ol class="briefing-steps">
+                        <li>
+                            Your team's voices control one pickle. Louder goes
+                            up; quieter goes down.
+                        </li>
+                        <li>
+                            Dodge floor clutter, flying utensils, and the
+                            ceiling spikes.
+                        </li>
+                        <li>Follow quick challenges to earn coins.</li>
+                        <li>
+                            Everyone clicks ready. The host starts the run when
+                            the whole team is set.
+                        </li>
+                    </ol>
+                    <button id="briefing-ready-button" type="button">
+                        I'm Ready
+                    </button>
+                    <p id="briefing-status">Read all four, then ready up.</p>
+                </div>
                 <ul id="recording-players"></ul>
                 <p
                     id="recording-upload-status"
@@ -453,18 +524,29 @@
                         <span class="game-over-label">Run over</span>
                         <strong><span id="final-score">0</span> pts</strong>
                         <p id="game-over-reason"></p>
+                        <div id="run-awards" class="run-awards hidden">
+                            <p id="loudest-award" class="award-row hidden">
+                                <span>Damn, you're loud!</span>
+                                <b id="loudest-player"></b>
+                            </p>
+                            <p id="quietest-award" class="award-row hidden">
+                                <span>Quietest teammate</span>
+                                <b id="quietest-player"></b>
+                            </p>
+                        </div>
                     </div>
                 </div>
                 <button id="restart-button" class="hidden" type="button">
                     Restart Run
                 </button>
                 <p id="game-message">
-                    Use your voice to steer the pickle. Avoid the obstacles and
-                    ceiling spikes.
+                    Use your voice to steer the pickle. Avoid floor clutter,
+                    flying utensils, and ceiling spikes. QTEs are optional;
+                    complete them to earn coins.
                 </p>
             </section>
 
-            <p id="status"></p>
+            <p id="status" class="hidden"></p>
         </main>
         <script src="https://cdn.jsdelivr.net/npm/@cloudflare/realtimekit@latest/dist/browser.js"></script>
         <script src="/gameRenderer.js"></script>

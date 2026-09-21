@@ -120,75 +120,160 @@
 
   function drawFloorObstacle(context, obstacle, screenX) {
     const y = GROUND_Y - obstacle.height;
-    const type = obstacle.id % 4;
+    const type = Math.floor(obstacle.id / 2) % 4;
     context.save();
     context.strokeStyle = colors.ink;
     context.lineWidth = 4;
+    context.lineJoin = "round";
 
     if (type === 0) {
+      // Soup can
       context.fillStyle = colors.red;
-      roundedRect(context, screenX, y + 8, obstacle.width, obstacle.height - 8, 8);
+      context.fillRect(screenX + 5, y + 5, obstacle.width - 10, obstacle.height - 10);
+      context.strokeRect(screenX + 5, y + 5, obstacle.width - 10, obstacle.height - 10);
+      context.fillStyle = colors.blue;
+      context.beginPath();
+      context.ellipse(screenX + obstacle.width / 2, y + 6, obstacle.width / 2 - 5, 6, 0, 0, Math.PI * 2);
       context.fill();
       context.stroke();
       context.fillStyle = colors.cream;
-      context.fillRect(screenX + 7, y + obstacle.height * 0.45, obstacle.width - 14, 10);
+      context.fillRect(screenX + 5, y + obstacle.height * 0.4, obstacle.width - 10, 18);
+      context.fillStyle = colors.ink;
+      context.font = "900 10px Trebuchet MS";
+      context.textAlign = "center";
+      context.fillText("SOUP", screenX + obstacle.width / 2, y + obstacle.height * 0.4 + 13);
     } else if (type === 1) {
+      // Mug
       context.fillStyle = colors.yellow;
-      roundedRect(context, screenX, y + 4, obstacle.width * 0.78, obstacle.height - 4, 7);
+      roundedRect(context, screenX + 3, y + 12, obstacle.width * 0.7, obstacle.height - 12, 7);
       context.fill();
       context.stroke();
       context.beginPath();
-      context.arc(screenX + obstacle.width * 0.79, y + obstacle.height * 0.58, obstacle.width * 0.25, -1.3, 1.3);
+      context.arc(screenX + obstacle.width * 0.72, y + obstacle.height * 0.62, obstacle.width * 0.23, -1.3, 1.3);
+      context.stroke();
+      context.strokeStyle = colors.blue;
+      context.lineWidth = 3;
+      context.beginPath();
+      context.moveTo(screenX + 17, y + 7);
+      context.quadraticCurveTo(screenX + 9, y, screenX + 18, y - 7);
+      context.moveTo(screenX + 32, y + 7);
+      context.quadraticCurveTo(screenX + 24, y, screenX + 33, y - 7);
       context.stroke();
     } else if (type === 2) {
+      // Toaster
       context.fillStyle = colors.blue;
-      roundedRect(context, screenX + 4, y, obstacle.width - 8, obstacle.height, 5);
+      roundedRect(context, screenX + 3, y + 13, obstacle.width - 6, obstacle.height - 13, 8);
       context.fill();
       context.stroke();
-      context.fillStyle = colors.cream;
-      context.fillRect(screenX + 10, y + 12, obstacle.width - 20, 14);
       context.fillStyle = colors.ink;
-      context.fillRect(screenX + obstacle.width / 2 - 7, y + 16, 14, 5);
+      roundedRect(context, screenX + 12, y + 18, obstacle.width - 24, 5, 2);
+      context.fill();
+      context.fillStyle = colors.counter;
+      roundedRect(context, screenX + obstacle.width * 0.28, y, obstacle.width * 0.44, 24, 4);
+      context.fill();
+      context.stroke();
+      context.strokeStyle = colors.ink;
+      context.beginPath();
+      context.moveTo(screenX + obstacle.width - 3, y + obstacle.height * 0.55);
+      context.lineTo(screenX + obstacle.width + 7, y + obstacle.height * 0.55);
+      context.stroke();
     } else {
+      // Condiment bottle
       context.fillStyle = colors.green;
-      roundedRect(context, screenX + obstacle.width * 0.18, y, obstacle.width * 0.64, obstacle.height, 10);
+      roundedRect(context, screenX + obstacle.width * 0.2, y + 14, obstacle.width * 0.6, obstacle.height - 14, 12);
       context.fill();
       context.stroke();
       context.fillStyle = colors.yellow;
-      context.fillRect(screenX + obstacle.width * 0.28, y + obstacle.height * 0.45, obstacle.width * 0.44, 8);
+      context.fillRect(screenX + obstacle.width * 0.33, y + 5, obstacle.width * 0.34, 12);
+      context.fillStyle = colors.cream;
+      context.beginPath();
+      context.arc(screenX + obstacle.width / 2, y + obstacle.height * 0.62, 10, 0, Math.PI * 2);
+      context.fill();
+      context.fillStyle = colors.red;
+      context.beginPath();
+      context.arc(screenX + obstacle.width / 2, y + obstacle.height * 0.62, 5, 0, Math.PI * 2);
+      context.fill();
     }
     context.restore();
   }
 
-  function drawCeilingObstacle(context, obstacle, screenX) {
-    const type = obstacle.id % 3;
+  function drawFlyingUtensil(context, obstacle, screenX) {
+    const screenY = GROUND_Y - obstacle.y - obstacle.height;
+    const type = Math.floor(obstacle.id / 2) % 3;
     context.save();
+    context.translate(screenX + obstacle.width / 2, screenY + obstacle.height / 2);
+    context.rotate(Math.sin(obstacle.id * 1.7) * 0.08);
     context.strokeStyle = colors.ink;
     context.lineWidth = 4;
+    context.lineCap = "round";
+    context.lineJoin = "round";
 
+    const left = -obstacle.width / 2;
+    const right = obstacle.width / 2;
     if (type === 0) {
-      context.strokeRect(screenX + obstacle.width / 2 - 2, 0, 4, obstacle.height * 0.45);
-      context.fillStyle = colors.red;
-      context.beginPath();
-      context.arc(screenX + obstacle.width / 2, obstacle.height * 0.7, obstacle.width * 0.43, 0, Math.PI * 2);
+      // Sideways fork
+      context.fillStyle = colors.blue;
+      roundedRect(context, left + 27, -5, obstacle.width - 27, 10, 5);
       context.fill();
+      context.stroke();
+      context.strokeStyle = colors.blue;
+      context.lineWidth = 5;
+      for (const tineY of [-12, -4, 4, 12]) {
+        context.beginPath();
+        context.moveTo(left, tineY);
+        context.lineTo(left + 20, tineY);
+        context.stroke();
+      }
+      context.strokeStyle = colors.ink;
+      context.lineWidth = 4;
+      context.beginPath();
+      context.moveTo(left, -12);
+      context.lineTo(left + 19, -12);
+      context.quadraticCurveTo(left + 27, -12, left + 27, -5);
+      context.lineTo(left + 34, -5);
+      context.moveTo(left, 12);
+      context.lineTo(left + 19, 12);
+      context.quadraticCurveTo(left + 27, 12, left + 27, 5);
+      context.lineTo(left + 34, 5);
+      context.moveTo(left, -4);
+      context.lineTo(left + 20, -4);
+      context.moveTo(left, 4);
+      context.lineTo(left + 20, 4);
       context.stroke();
     } else if (type === 1) {
+      // Sideways spoon
       context.fillStyle = colors.blue;
-      roundedRect(context, screenX + obstacle.width * 0.35, 0, obstacle.width * 0.3, obstacle.height * 0.58, 5);
+      roundedRect(context, left + 34, -5, obstacle.width - 34, 10, 5);
       context.fill();
       context.stroke();
-      context.fillStyle = colors.ink;
       context.beginPath();
-      context.ellipse(screenX + obstacle.width / 2, obstacle.height * 0.78, obstacle.width * 0.45, obstacle.height * 0.2, 0, 0, Math.PI * 2);
-      context.fill();
-    } else {
-      context.fillStyle = colors.yellow;
-      roundedRect(context, screenX, 0, obstacle.width, obstacle.height, 4);
+      context.ellipse(left + 18, 0, 20, 14, 0, 0, Math.PI * 2);
       context.fill();
       context.stroke();
+    } else {
+      // Sideways knife
       context.fillStyle = colors.red;
-      context.fillRect(screenX + 7, obstacle.height - 14, obstacle.width - 14, 7);
+      roundedRect(context, right - 38, -9, 38, 18, 5);
+      context.fill();
+      context.stroke();
+      context.fillStyle = colors.blue;
+      context.beginPath();
+      context.moveTo(right - 34, -10);
+      context.lineTo(left, -8);
+      context.lineTo(left + 12, 10);
+      context.lineTo(right - 34, 10);
+      context.closePath();
+      context.fill();
+      context.stroke();
+    }
+
+    context.strokeStyle = colors.yellow;
+    context.lineWidth = 3;
+    for (const offsetY of [-10, 0, 10]) {
+      context.beginPath();
+      context.moveTo(right + 5, offsetY);
+      context.lineTo(right + 18, offsetY);
+      context.stroke();
     }
     context.restore();
   }
@@ -199,8 +284,8 @@
       if (screenX + obstacle.width < -20 || screenX > WIDTH + 20) {
         continue;
       }
-      if (obstacle.fromTop) {
-        drawCeilingObstacle(context, obstacle, screenX);
+      if (obstacle.kind === "utensil") {
+        drawFlyingUtensil(context, obstacle, screenX);
       } else {
         drawFloorObstacle(context, obstacle, screenX);
       }

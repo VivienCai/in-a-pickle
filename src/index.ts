@@ -126,7 +126,6 @@ export default {
 
       if (action === "sfx" && request.method === "POST") {
         const playerId = url.searchParams.get("playerId");
-        const stage = url.searchParams.get("stage");
         if (!playerId) {
           return errorResponse("playerId is required.");
         }
@@ -134,10 +133,7 @@ export default {
         const internalUrl = new URL("https://room.internal/internal/sfx");
         internalUrl.searchParams.set("roomCode", roomCode);
         internalUrl.searchParams.set("playerId", playerId);
-        if (stage === "death" || stage === "triumph") {
-          internalUrl.searchParams.set("stage", stage);
-        }
-        const contentType = request.headers.get("Content-Type") ?? "audio/webm";
+        const contentType = request.headers.get("Content-Type") ?? "multipart/form-data";
         return room.fetch(new Request(internalUrl, {
           method: "POST",
           headers: { "Content-Type": contentType },

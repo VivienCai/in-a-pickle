@@ -1,4 +1,4 @@
-export type RoomStatus = "lobby" | "recording" | "playing" | "finished";
+export type RoomStatus = "lobby" | "recording" | "briefing" | "playing" | "finished";
 
 export interface Player {
   id: string;
@@ -7,32 +7,38 @@ export interface Player {
   micReady: boolean;
   speaking: boolean;
   recordingReady: boolean;
+  briefingReady: boolean;
   hasDeathClip: boolean;
-  hasTriumphClip: boolean;
+  hasStartClip: boolean;
+  hasCoinClip: boolean;
 }
 
 export interface RoomState {
   roomCode: string;
   status: RoomStatus;
-  recordingStage: "death" | "triumph" | null;
+  recordingStage: "sounds" | null;
   soundsReady: boolean;
   stageSoundsReady: boolean;
   recordingsSubmitted: boolean;
+  briefingComplete: boolean;
   hasDisconnectedPlayers: boolean;
   players: Player[];
 }
 
 export interface Obstacle {
   id: number;
+  kind: "floor" | "utensil";
   x: number;
+  y: number;
   width: number;
   height: number;
-  fromTop: boolean;
 }
 
 export interface VoiceQte {
-  type: "quiet" | "steady";
+  type: "quiet" | "steady" | "solo";
   prompt: string;
+  targetPlayerId: string | null;
+  targetPlayerName: string | null;
   remainingTicks: number;
   totalTicks: number;
   successfulTicks: number;
@@ -42,6 +48,11 @@ export interface QteResult {
   success: boolean;
   message: string;
   remainingTicks: number;
+}
+
+export interface RunAwards {
+  loudestPlayer: string | null;
+  quietestPlayer: string | null;
 }
 
 export interface LiveGameState {
@@ -56,6 +67,7 @@ export interface LiveGameState {
   levelSeed: number;
   obstacles: Obstacle[];
   gameOverReason: string | null;
+  awards: RunAwards;
   qte: VoiceQte | null;
   qteResult: QteResult | null;
   nextQteTick: number;
@@ -66,6 +78,7 @@ export type ClientMessage =
   | { type: "getState" }
   | { type: "startGame" }
   | { type: "restartGame" }
+  | { type: "briefingReady" }
   | { type: "micReady" }
   | { type: "micNotReady" }
   | { type: "reportVolume"; volume: number };
@@ -73,6 +86,6 @@ export type ClientMessage =
 export type ServerMessage =
   | { type: "state"; state: RoomState; game: LiveGameState | null }
   | { type: "pong" }
-  | { type: "error"; message: string }
+  | { type: "error"; message: string; resetRecordings?: boolean }
   | { type: "gameOver"; finalScore: number; reason: string }
   | { type: "playSound"; url: string };

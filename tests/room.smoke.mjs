@@ -56,14 +56,21 @@ const replacementSocket = await connect(room);
 await new Promise((resolve) => setTimeout(resolve, 100));
 const connectedState = await fetch(`${baseUrl}/api/rooms/${room.roomCode}/state`).then((response) => response.json());
 assert.equal(connectedState.players.some((player) => player.id === room.playerId), true);
+assert.equal(connectedState.players.find((player) => player.id === room.playerId)?.briefingReady, false);
+assert.equal(connectedState.briefingComplete, false);
 firstSocket.close();
 
 const recordingStatePromise = waitForState(
   replacementSocket,
-  (state) => state.status === "recording" && state.recordingStage === "death",
+  (state) => state.status === "recording" && state.recordingStage === "sounds",
 );
 replacementSocket.send(JSON.stringify({ type: "startGame" }));
 await recordingStatePromise;
+
+replacementSocket.send(JSON.stringify({ type: "briefingReady" }));
+await new Promise((resolve) => setTimeout(resolve, 100));
+const prematureBriefingState = await fetch(`${baseUrl}/api/rooms/${room.roomCode}/state`).then((response) => response.json());
+assert.equal(prematureBriefingState.players.find((player) => player.id === room.playerId)?.briefingReady, false);
 
 replacementSocket.close();
 await new Promise((resolve) => setTimeout(resolve, 300));

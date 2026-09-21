@@ -23,6 +23,11 @@ const restartButton = document.querySelector("#restart-button");
 const gameOverPanel = document.querySelector("#game-over-panel");
 const finalScore = document.querySelector("#final-score");
 const gameOverReason = document.querySelector("#game-over-reason");
+const runAwards = document.querySelector("#run-awards");
+const loudestAward = document.querySelector("#loudest-award");
+const loudestPlayer = document.querySelector("#loudest-player");
+const quietestAward = document.querySelector("#quietest-award");
+const quietestPlayer = document.querySelector("#quietest-player");
 const qtePanel = document.querySelector("#qte-panel");
 const qteLabel = qtePanel.querySelector(".qte-label");
 const qtePrompt = document.querySelector("#qte-prompt");
@@ -41,10 +46,15 @@ const rerecordButton = document.querySelector("#rerecord-button");
 const recordingPlayers = document.querySelector("#recording-players");
 const recordingStartButton = document.querySelector("#recording-start-button");
 const recordingUploadStatus = document.querySelector("#recording-upload-status");
+const briefingPanel = document.querySelector("#briefing-panel");
+const briefingReadyButton = document.querySelector("#briefing-ready-button");
+const briefingStatus = document.querySelector("#briefing-status");
 const gameRenderer = globalThis.PickleGameRenderer.create(gameCanvas);
 
 let socket;
 let socketGeneration = 0;
+let heartbeatTimer = null;
+let reconnectTimer = null;
 const savedRoomKey = "in-a-pickle-room";
 let audioContext;
 let analyser;
@@ -52,6 +62,7 @@ let microphoneStream;
 let volumeTimer;
 let rawVolumeData;
 let calibration = null;
+let isCalibrating = false;
 let voiceMeeting = null;
 let voiceModeGeneration = 0;
 let voiceParticipantListeners = null;
@@ -63,13 +74,30 @@ let mediaRecorder = null;
 let recordingStream = null;
 let recordingAudioStream = null;
 let recordingCanvas = null;
+let recordingVideoTimer = null;
 let recordingTimer = null;
 let recordingStartedAt = 0;
 let recordedChunks = [];
 let recordedClip = null;
+const recordedClips = new Map();
+const recordingSteps = [
+  {
+    stage: "death",
+    prompt: "What sound do you make when you stub your toe on a sharp corner?",
+  },
+  {
+    stage: "start",
+    prompt: "What do you say when you're about to go on an 8-hour road trip with your family?",
+  },
+  {
+    stage: "coin",
+    prompt: "You just found a shiny coin. What sound do you make?",
+  },
+];
 let previewUrl = null;
 let activeRecordingStage = null;
 let recordingGeneration = 0;
+let uploadingClips = false;
 
 function showStatus(message) {
   statusText.textContent = message;
@@ -192,7 +220,7 @@ function syncRemoteAudio(participant, update = {}) {
   if (currentTrack?.id !== audioTrack.id) {
     audio.srcObject = new MediaStream([audioTrack]);
   }
-  audio.muted = recordingVoiceMode !== "open";
+  audio.muted = recordingVoiceMode !== "open" || isCalibrating;
   if (!audio.muted) {
     void audio.play().catch(() => setVoiceStatus("tap the page to hear players"));
   }
@@ -221,9 +249,14 @@ function setRemoteAudioMuted(muted) {
 }
 
 async function syncRecordingVoice(state) {
-  const mode = state.status === "recording"
-    ? "isolated"
-    : "open";
+  const savedRoom = JSON.parse(localStorage.getItem(savedRoomKey) ?? "null");
+  const currentPlayer = state.players.find((player) => player.id === savedRoom?.playerId);
+  const finishedLocalRecordings = recordedClips.size === recordingSteps.length;
+  const mode = isCalibrating
+    ? "calibrating"
+    : state.status === "recording" && !currentPlayer?.recordingReady && !finishedLocalRecordings
+      ? "isolated"
+      : "open";
   if (!voiceMeeting || recordingVoiceMode === mode) {
     return;
   }
@@ -242,7 +275,9 @@ async function syncRecordingVoice(state) {
     }
 
     recordingVoiceMode = mode;
-    if (mode === "isolated") {
+    if (mode === "calibrating") {
+      setVoiceStatus("calibrating privately");
+    } else if (mode === "isolated") {
       setVoiceStatus("recording privately");
     } else {
       setVoiceStatus("connected");
@@ -256,7 +291,7 @@ async function syncRecordingVoice(state) {
 }
 
 document.addEventListener("click", () => {
-  if (recordingVoiceMode === "open") {
+  if (recordingVoiceMode === "open" && !isCalibrating) {
     setRemoteAudioMuted(false);
   }
 });
@@ -271,7 +306,9 @@ function resetClipPreview() {
   clipPreview.classList.add("hidden");
   uploadClipButton.classList.add("hidden");
   uploadClipButton.disabled = false;
-  uploadClipButton.textContent = "Use This Sound & Ready Up";
+  uploadClipButton.textContent = activeRecordingStage === "coin"
+    ? "Upload All Sounds"
+    : "Keep Sound & Continue";
   rerecordButton.classList.add("hidden");
   rerecordButton.disabled = false;
   recordButton.classList.remove("hidden", "recording");
@@ -316,13 +353,26 @@ async function startClipRecording() {
       ? new MediaStream([gameplayTrack.clone()])
       : await navigator.mediaDevices.getUserMedia({ audio: true });
     recordingCanvas = document.createElement("canvas");
-    recordingCanvas.width = 2;
-    recordingCanvas.height = 2;
-    recordingCanvas.getContext("2d")?.fillRect(0, 0, 2, 2);
+    recordingCanvas.width = 160;
+    recordingCanvas.height = 90;
+    const recordingContext = recordingCanvas.getContext("2d");
+    let videoFrame = 0;
+    const drawRecordingFrame = () => {
+      if (!recordingContext) {
+        return;
+      }
+      recordingContext.fillStyle = videoFrame % 2 === 0 ? "#4b842f" : "#526141";
+      recordingContext.fillRect(0, 0, recordingCanvas.width, recordingCanvas.height);
+      recordingContext.fillStyle = "#fff8df";
+      recordingContext.fillRect(16 + (videoFrame % 8) * 16, 34, 16, 22);
+      videoFrame += 1;
+    };
+    drawRecordingFrame();
+    recordingVideoTimer = setInterval(drawRecordingFrame, 150);
     if (typeof recordingCanvas.captureStream !== "function") {
       throw new Error("This browser cannot create a compatible recording.");
     }
-    const videoStream = recordingCanvas.captureStream(1);
+    const videoStream = recordingCanvas.captureStream(5);
     recordingStream = new MediaStream([
       ...videoStream.getVideoTracks(),
       ...recordingAudioStream.getAudioTracks(),
@@ -348,6 +398,8 @@ async function startClipRecording() {
     recorder.addEventListener("stop", () => {
       clearInterval(recordingTimer);
       recordingTimer = null;
+      clearInterval(recordingVideoTimer);
+      recordingVideoTimer = null;
       recordingStream?.getTracks().forEach((track) => track.stop());
       recordingStream = null;
       recordingAudioStream = null;
@@ -375,7 +427,7 @@ async function startClipRecording() {
       clipPreview.classList.remove("hidden");
       uploadClipButton.classList.remove("hidden");
       rerecordButton.classList.remove("hidden");
-      recordingCopy.textContent = "Listen to it and ready up if you're satisfied.";
+      recordingCopy.textContent = "Listen to it, then keep it or record it again.";
     });
     recorder.start();
     recordingStartedAt = Date.now();
@@ -395,6 +447,8 @@ async function startClipRecording() {
     console.error("Could not start sound recording:", error);
     recordingStream?.getTracks().forEach((track) => track.stop());
     recordingAudioStream?.getTracks().forEach((track) => track.stop());
+    clearInterval(recordingVideoTimer);
+    recordingVideoTimer = null;
     recordingStream = null;
     recordingAudioStream = null;
     recordingCanvas = null;
@@ -407,8 +461,20 @@ async function startClipRecording() {
   }
 }
 
-async function uploadClip() {
-  if (!recordedClip) {
+function showRecordingStep(stage) {
+  cancelClipRecording();
+  activeRecordingStage = stage;
+  resetClipPreview();
+  const stepIndex = recordingSteps.findIndex((step) => step.stage === stage);
+  recordingTitle.textContent = `Recording Booth (${stepIndex + 1} of ${recordingSteps.length})`;
+  recordingCopy.textContent = recordingSteps[stepIndex]?.prompt ?? "Record your sound.";
+  recordingProgress.value = 0;
+  recordingTitle.classList.remove("hidden");
+  recordingCopy.classList.remove("hidden");
+}
+
+async function uploadClips() {
+  if (recordedClips.size !== recordingSteps.length) {
     return;
   }
 
@@ -417,39 +483,58 @@ async function uploadClip() {
     return;
   }
 
+  uploadingClips = true;
   uploadClipButton.disabled = true;
-  uploadClipButton.textContent = "Uploading...";
+  uploadClipButton.textContent = "Uploading All Sounds...";
   rerecordButton.disabled = true;
-  const uploadedStage = latestState?.recordingStage ?? activeRecordingStage;
-  if (uploadedStage !== "death" && uploadedStage !== "triumph") {
-    recordingCopy.textContent = "The recording round changed. Refresh and try again.";
-    uploadClipButton.disabled = false;
-    rerecordButton.disabled = false;
-    return;
-  }
-  recordingCopy.textContent = "Uploading your sound effect...";
+  recordingCopy.textContent = "Sit tight, uploading all three sounds to Stream...";
   try {
+    const form = new FormData();
+    for (const { stage } of recordingSteps) {
+      const clip = recordedClips.get(stage);
+      const extension = clip.type.includes("mp4") ? "mp4" : "webm";
+      form.append(stage, clip, `${stage}.${extension}`);
+    }
     const response = await fetch(
-      `/api/rooms/${encodeURIComponent(room.roomCode)}/sfx?playerId=${encodeURIComponent(room.playerId)}&stage=${encodeURIComponent(uploadedStage)}`,
+      `/api/rooms/${encodeURIComponent(room.roomCode)}/sfx?playerId=${encodeURIComponent(room.playerId)}`,
       {
         method: "POST",
-        headers: { "Content-Type": recordedClip.type || "audio/webm" },
-        body: recordedClip,
+        body: form,
       },
     );
     const data = await response.json();
     if (!response.ok) {
       throw new Error(data.error ?? "Could not save your sound.");
     }
-    if (latestState?.recordingStage === uploadedStage) {
-      recordingCopy.textContent = "Sound saved. You're ready to hear the other ready players.";
-    }
+    recordingCopy.textContent = "All three sounds uploaded. Stream is finishing them now.";
+    uploadClipButton.textContent = "Sounds Uploaded";
   } catch (error) {
-    recordingCopy.textContent = error.message ?? "Could not save your sound.";
+    recordingCopy.textContent = error.message ?? "Could not save your sounds.";
     uploadClipButton.disabled = false;
-    uploadClipButton.textContent = "Use This Sound & Ready Up";
+    uploadClipButton.textContent = "Try Uploading All Sounds Again";
     rerecordButton.disabled = false;
+  } finally {
+    uploadingClips = false;
   }
+}
+
+function keepRecordedClip() {
+  if (!recordedClip || !activeRecordingStage) {
+    return;
+  }
+
+  recordedClips.set(activeRecordingStage, recordedClip);
+  const currentIndex = recordingSteps.findIndex((step) => step.stage === activeRecordingStage);
+  const nextStep = recordingSteps[currentIndex + 1];
+  if (nextStep) {
+    showRecordingStep(nextStep.stage);
+    return;
+  }
+
+  if (latestState) {
+    void syncRecordingVoice(latestState);
+  }
+  void uploadClips();
 }
 
 function playSound(url) {
@@ -511,7 +596,7 @@ async function startVolumeMonitoring() {
     rawVolumeData = new Uint8Array(analyser.fftSize);
 
     volumeTimer = setInterval(() => {
-      if (!socket || socket.readyState !== WebSocket.OPEN) {
+      if (!socket || socket.readyState !== WebSocket.OPEN || isCalibrating) {
         return;
       }
 
@@ -571,35 +656,47 @@ async function calibrateMicrophone() {
   }
 
   calibration = null;
+  isCalibrating = true;
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ type: "micNotReady" }));
+    socket.send(JSON.stringify({ type: "reportVolume", volume: 0 }));
   }
   calibrateButton.disabled = true;
-  calibrationInstructions.textContent = "Stay quiet for a moment...";
-  const quietSamples = await collectVolumeSamples(1500);
-
-  calibrationInstructions.textContent = "Now make the loudest sound you can!";
-  await wait(500);
-  const loudSamples = await collectVolumeSamples(1800);
-
-  const noiseFloor = percentile(quietSamples, 0.8);
-  const loudLevel = percentile(loudSamples, 0.9);
-  if (loudLevel - noiseFloor < 0.03) {
-    calibrateButton.disabled = false;
-    calibrationInstructions.textContent = "That was too quiet. Try again and make more noise.";
-    showStatus("");
-    return;
+  if (latestState) {
+    await syncRecordingVoice(latestState);
   }
+  try {
+    calibrationInstructions.textContent = "Stay quiet for a moment...";
+    const quietSamples = await collectVolumeSamples(1500);
 
-  calibration = { noiseFloor, loudLevel };
-  calibrateButton.textContent = "Recalibrate Microphone";
-  calibrationInstructions.textContent = "Calibrated. You can recalibrate later if your setup changes.";
-  micStatus.textContent = "Microphone calibrated";
-  micStatus.classList.remove("pending");
-  micStatus.classList.remove("hidden");
-  showStatus("");
-  if (socket && socket.readyState === WebSocket.OPEN) {
-    socket.send(JSON.stringify({ type: "micReady" }));
+    calibrationInstructions.textContent = "Now make the loudest sound you can!";
+    await wait(500);
+    const loudSamples = await collectVolumeSamples(1800);
+
+    const noiseFloor = percentile(quietSamples, 0.8);
+    const loudLevel = percentile(loudSamples, 0.9);
+    if (loudLevel - noiseFloor < 0.03) {
+      calibrationInstructions.textContent = "That was too quiet. Try again and make more noise.";
+      showStatus("");
+      return;
+    }
+
+    calibration = { noiseFloor, loudLevel };
+    calibrateButton.textContent = "Recalibrate Microphone";
+    calibrationInstructions.textContent = "Calibrated. You can recalibrate later if your setup changes.";
+    micStatus.textContent = "Microphone calibrated";
+    micStatus.classList.remove("pending");
+    micStatus.classList.remove("hidden");
+    showStatus("");
+    if (socket && socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "micReady" }));
+    }
+  } finally {
+    isCalibrating = false;
+    calibrateButton.disabled = false;
+    if (latestState) {
+      await syncRecordingVoice(latestState);
+    }
   }
 }
 
@@ -631,77 +728,79 @@ function renderState(state, gameState) {
   syncRecordingVoice(state);
   startButton.classList.toggle("hidden", state.status !== "lobby" || !currentPlayer?.isHost);
   startButton.disabled = state.hasDisconnectedPlayers;
-  startButton.textContent = state.hasDisconnectedPlayers ? "Waiting for Player" : "Record Sounds";
+  startButton.textContent = state.hasDisconnectedPlayers ? "Waiting for Player" : "Let's Start!";
   restartButton.classList.toggle("hidden", state.status !== "finished" || !currentPlayer?.isHost);
+  const showBriefing = state.status === "briefing";
 
   recordingPlayers.replaceChildren();
   for (const player of state.players) {
     const item = document.createElement("li");
     item.className = "player-row";
+    item.classList.toggle("speaking", player.recordingReady && player.speaking);
     const name = document.createElement("span");
     name.textContent = `${player.name}${player.id === currentPlayer?.id ? " (you)" : ""}`;
     const readiness = document.createElement("span");
-    readiness.className = player.recordingReady ? "mic-status ready" : "mic-status waiting";
-    readiness.textContent = player.recordingReady ? "READY" : "RECORDING";
+    const playerReady = showBriefing ? player.briefingReady : player.recordingReady;
+    readiness.className = playerReady ? "mic-status ready" : "mic-status waiting";
+    readiness.textContent = playerReady ? "READY" : showBriefing ? "READING" : "RECORDING";
     item.append(name, readiness);
     recordingPlayers.append(item);
   }
 
   const inRecordingRound = state.status === "recording";
-  recording.classList.toggle("hidden", !inRecordingRound);
-  if (inRecordingRound) {
+  const inStaging = inRecordingRound || showBriefing;
+  recording.classList.toggle("hidden", !inStaging);
+  if (inStaging) {
     lobby.classList.add("hidden");
     game.classList.add("hidden");
     document.body.classList.remove("in-game");
     const isReady = currentPlayer?.recordingReady;
     const everyoneSubmitted = state.recordingsSubmitted;
-    const completedAllRecordings = state.recordingStage === "triumph" && isReady;
-    const processingSounds = everyoneSubmitted && !state.stageSoundsReady;
+    const completedAllRecordings = isReady;
+    const processingSounds = inRecordingRound && everyoneSubmitted && !state.stageSoundsReady;
     const waitingForReconnect = state.hasDisconnectedPlayers;
+    briefingPanel.classList.toggle("hidden", !showBriefing);
+    briefingReadyButton.disabled = Boolean(currentPlayer?.briefingReady);
+    briefingReadyButton.textContent = currentPlayer?.briefingReady ? "Ready!" : "I'm Ready";
+    briefingStatus.textContent = currentPlayer?.briefingReady
+      ? state.briefingComplete
+        ? "Everyone is ready. The host can start the run."
+        : "You're ready. Waiting for the rest of the team..."
+      : "Read all four, then ready up.";
     recordingTitle.classList.toggle("hidden", completedAllRecordings);
     recordingCopy.classList.toggle("hidden", completedAllRecordings);
     recordingUploadStatus.classList.toggle("hidden", !processingSounds && !waitingForReconnect);
     recordingUploadStatus.textContent = waitingForReconnect
       ? "Waiting for a disconnected player to rejoin..."
       : processingSounds
-        ? "Sit tight, uploading to Stream and finishing everyone's sounds..."
+        ? "Sit tight, uploading to Stream..."
         : "";
-    const showFinalStart = state.recordingStage === "triumph" && currentPlayer?.isHost && everyoneSubmitted && !waitingForReconnect;
+    const canStartInstructions = inRecordingRound && state.soundsReady;
+    const showFinalStart = currentPlayer?.isHost && !waitingForReconnect && (canStartInstructions || showBriefing);
     recordingStartButton.classList.toggle("hidden", !showFinalStart);
-    recordingStartButton.disabled = !everyoneSubmitted || !state.soundsReady;
-    recordingStartButton.textContent = state.soundsReady ? "Start Game" : "Uploading...";
-    if (activeRecordingStage !== state.recordingStage) {
-      cancelClipRecording();
-      activeRecordingStage = state.recordingStage;
-      resetClipPreview();
-      recordingTitle.classList.remove("hidden");
-      recordingCopy.classList.remove("hidden");
-      recordingProgress.value = 0;
-      const isDeathStage = state.recordingStage === "death";
-      recordingTitle.textContent = isDeathStage ? "Death Sound" : "Triumph Sound";
-      recordingCopy.textContent = isDeathStage
-        ? "Record the sound you'd make when you crash into a kitchen obstacle."
-        : "Record the sound you'd make when you win.";
+    recordingStartButton.disabled = showBriefing && !state.briefingComplete;
+    recordingStartButton.textContent = canStartInstructions
+      ? "Start Instructions"
+      : state.briefingComplete
+        ? "Start Run"
+        : "Waiting for Everyone...";
+    if (inRecordingRound && !activeRecordingStage && !isReady) {
+      recordedClips.clear();
+      showRecordingStep("death");
     }
-    if (isReady) {
-      if (state.recordingStage === "triumph" && everyoneSubmitted) {
-        recordingCopy.textContent = state.soundsReady
-          ? currentPlayer?.isHost
-            ? "All sounds are ready. Start the game when everyone is set."
-            : "All sounds are ready. Waiting for the host to start the game."
-          : "Everyone is ready. Stream is finishing the sounds in the background...";
-      } else {
-        recordingCopy.textContent = "You're ready. You can now hear the other ready players.";
-      }
+    if (showBriefing || isReady) {
       recordButton.classList.add("hidden");
       uploadClipButton.classList.add("hidden");
       rerecordButton.classList.add("hidden");
-      if (state.recordingStage === "triumph") {
-        recordingTitle.classList.add("hidden");
-        recordingCopy.classList.add("hidden");
-        recordingProgress.classList.add("hidden");
-        clipPreview.classList.add("hidden");
-      }
+      recordingTitle.classList.add("hidden");
+      recordingCopy.classList.add("hidden");
+      recordingProgress.classList.add("hidden");
+      clipPreview.classList.add("hidden");
+    } else if (recordedClips.size === recordingSteps.length && !uploadingClips) {
+      uploadClipButton.classList.remove("hidden");
+      uploadClipButton.disabled = false;
+      uploadClipButton.textContent = "Upload All Sounds";
+      rerecordButton.classList.remove("hidden");
     } else if (!recordedClip && mediaRecorder?.state !== "recording") {
       recordButton.classList.remove("hidden");
     }
@@ -717,6 +816,12 @@ function renderState(state, gameState) {
     finalScore.textContent = gameState.score;
     gameOverReason.textContent = gameState.gameOverReason ?? "";
     gameOverPanel.classList.toggle("hidden", state.status !== "finished");
+    const awards = gameState.awards ?? {};
+    loudestPlayer.textContent = awards.loudestPlayer ?? "";
+    quietestPlayer.textContent = awards.quietestPlayer ?? "";
+    loudestAward.classList.toggle("hidden", !awards.loudestPlayer);
+    quietestAward.classList.toggle("hidden", !awards.quietestPlayer);
+    runAwards.classList.toggle("hidden", !awards.loudestPlayer && !awards.quietestPlayer);
     const teamVolume = gameState.averageVolume;
     volumeMeter.value = teamVolume;
     volumePanel.classList.toggle("quiet", teamVolume < 0.15);
@@ -727,7 +832,7 @@ function renderState(state, gameState) {
     qtePanel.classList.toggle("success", Boolean(qteResult?.success));
     qtePanel.classList.toggle("failure", Boolean(qteResult && !qteResult.success));
     if (activeQte) {
-      qteLabel.textContent = "Quick challenge";
+      qteLabel.textContent = activeQte.type === "solo" ? "Solo challenge" : "Quick challenge";
       qtePrompt.textContent = activeQte.prompt;
       qteProgress.classList.remove("hidden");
       qteProgress.max = activeQte.totalTicks;
@@ -737,16 +842,18 @@ function renderState(state, gameState) {
       qtePrompt.textContent = qteResult.message;
       qteProgress.classList.add("hidden");
     }
-    gameMessage.textContent = gameState.gameOverReason ?? "Use your voice to steer the pickle. Avoid the obstacles and ceiling spikes.";
+    gameMessage.textContent = gameState.gameOverReason ?? "Use your voice to steer the pickle. Avoid floor clutter, flying utensils, and ceiling spikes. QTEs are optional; complete them to earn coins.";
     gameRenderer.setState(gameState);
   } else {
-    if (!inRecordingRound && activeRecordingStage) {
+    if (!inStaging && activeRecordingStage) {
       cancelClipRecording();
     }
     game.classList.add("hidden");
     document.body.classList.remove("in-game");
-    if (!inRecordingRound) {
+    if (!inStaging) {
       activeRecordingStage = null;
+      recordedClips.clear();
+      uploadingClips = false;
       recordingStartButton.classList.add("hidden");
       recording.classList.add("hidden");
       lobby.classList.remove("hidden");
@@ -754,7 +861,11 @@ function renderState(state, gameState) {
   }
 }
 
-function connectToRoom(room) {
+function connectToRoom(room, reconnectAttempt = 0) {
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
   localStorage.setItem(savedRoomKey, JSON.stringify(room));
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
   const url = `${protocol}//${location.host}/ws?roomCode=${encodeURIComponent(room.roomCode)}&playerId=${encodeURIComponent(room.playerId)}`;
@@ -769,6 +880,7 @@ function connectToRoom(room) {
       return;
     }
     connected = true;
+    reconnectAttempt = 0;
     const savedRoom = JSON.parse(localStorage.getItem(savedRoomKey) ?? "null");
     if (savedRoom) {
       delete savedRoom.disconnectedAt;
@@ -795,6 +907,12 @@ function connectToRoom(room) {
     lobby.classList.remove("hidden");
     disconnectActions.classList.add("hidden");
     showStatus("");
+    roomSocket.send(JSON.stringify({ type: "ping" }));
+    heartbeatTimer = setInterval(() => {
+      if (roomSocket.readyState === WebSocket.OPEN) {
+        roomSocket.send(JSON.stringify({ type: "ping" }));
+      }
+    }, 30_000);
     void startVolumeMonitoring();
     void joinVoice(room);
   });
@@ -813,14 +931,32 @@ function connectToRoom(room) {
     } else if (message.type === "playSound") {
       playSound(message.url);
     } else if (message.type === "error") {
+      if (message.resetRecordings) {
+        recordedClips.clear();
+        activeRecordingStage = null;
+        resetClipPreview();
+      }
       showStatus(message.message);
     }
   });
 
-  roomSocket.addEventListener("close", () => {
+  roomSocket.addEventListener("close", (event) => {
     if (connectionGeneration !== socketGeneration) {
       return;
     }
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+
+    const cannotReconnect = event.reason === "Reconnected in another tab" || event.reason === "Rejoin window expired";
+    if (!cannotReconnect && reconnectAttempt < 4) {
+      const delay = Math.min(4_000, 750 * (reconnectAttempt + 1));
+      showStatus("Connection interrupted. Reconnecting...");
+      reconnectTimer = setTimeout(() => {
+        connectToRoom(room, reconnectAttempt + 1);
+      }, delay);
+      return;
+    }
+
     void leaveVoice();
     cancelClipRecording();
     recording.classList.add("hidden");
@@ -862,6 +998,10 @@ rejoinButton.addEventListener("click", () => {
 });
 
 newRoomButton.addEventListener("click", () => {
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+  clearTimeout(reconnectTimer);
+  reconnectTimer = null;
   socketGeneration += 1;
   const previousSocket = socket;
   socket = undefined;
@@ -896,10 +1036,6 @@ async function showRejoinPrompt() {
     return;
   }
 
-  rejoinCodeText.textContent = room.roomCode;
-  rejoinYesButton.textContent = `Rejoin Room ${room.roomCode}`;
-  rejoinPrompt.classList.remove("hidden");
-
   try {
     const response = await fetch(
       `/api/rooms/${encodeURIComponent(room.roomCode)}/rejoin?playerId=${encodeURIComponent(room.playerId)}`,
@@ -917,8 +1053,11 @@ async function showRejoinPrompt() {
       rejoinPrompt.classList.add("hidden");
       return;
     }
+    rejoinCodeText.textContent = room.roomCode;
+    rejoinYesButton.textContent = `Rejoin Room ${room.roomCode}`;
+    rejoinPrompt.classList.remove("hidden");
   } catch {
-    // Keep the prompt available during temporary network failures.
+    // A temporary network failure should not offer an unverified stale room.
     return;
   }
 }
@@ -984,13 +1123,22 @@ startButton.addEventListener("click", () => {
 calibrateButton.addEventListener("click", calibrateMicrophone);
 recordButton.addEventListener("click", startClipRecording);
 rerecordButton.addEventListener("click", () => {
+  recordedClips.delete(activeRecordingStage);
+  if (latestState) {
+    void syncRecordingVoice(latestState);
+  }
   resetClipPreview();
   recordingProgress.value = 0;
-  recordingCopy.textContent = latestState?.recordingStage === "triumph"
-    ? "Record the sound you'd make when you win."
-    : "Record the sound you'd make when you crash into a kitchen obstacle.";
+  recordingCopy.textContent = recordingSteps.find(
+    (step) => step.stage === activeRecordingStage,
+  )?.prompt ?? "Record your sound.";
 });
-uploadClipButton.addEventListener("click", uploadClip);
+uploadClipButton.addEventListener("click", keepRecordedClip);
+briefingReadyButton.addEventListener("click", () => {
+  if (socket && socket.readyState === WebSocket.OPEN) {
+    socket.send(JSON.stringify({ type: "briefingReady" }));
+  }
+});
 recordingStartButton.addEventListener("click", () => {
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ type: "startGame" }));

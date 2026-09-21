@@ -60,7 +60,8 @@ export async function uploadClip(
   try {
     const formData = new FormData();
     const extension = clip.type.includes("mp4") ? "mp4" : "webm";
-    formData.append("file", clip, `sound-effect.${extension}`);
+    const fileName = clip instanceof File ? clip.name : `sound-effect.${extension}`;
+    formData.append("file", clip, fileName);
 
     const uploadResponse = await fetch(baseUrl(env), {
       method: "POST",
@@ -162,9 +163,9 @@ export async function prepareClipAudio(
   }
 }
 
-export async function deleteClip(env: StreamConfig, uid: string): Promise<void> {
+export async function deleteClip(env: StreamConfig, uid: string): Promise<boolean> {
   if (!isConfigured(env) || !uid) {
-    return;
+    return false;
   }
 
   try {
@@ -172,10 +173,13 @@ export async function deleteClip(env: StreamConfig, uid: string): Promise<void> 
       method: "DELETE",
       headers: authHeaders(env),
     });
-    if (!response.ok) {
+    if (!response.ok && response.status !== 404) {
       console.error(`Stream clip deletion failed: ${response.status}`);
+      return false;
     }
+    return true;
   } catch (error) {
     console.error("Stream clip deletion error:", error);
+    return false;
   }
 }
