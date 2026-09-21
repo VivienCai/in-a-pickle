@@ -62,7 +62,6 @@ let recordingVoiceMode = null;
 let mediaRecorder = null;
 let recordingStream = null;
 let recordingAudioStream = null;
-let recordingCanvas = null;
 let recordingTimer = null;
 let recordingStartedAt = 0;
 let recordedChunks = [];
@@ -315,25 +314,13 @@ async function startClipRecording() {
     recordingAudioStream = gameplayTrack
       ? new MediaStream([gameplayTrack.clone()])
       : await navigator.mediaDevices.getUserMedia({ audio: true });
-    recordingCanvas = document.createElement("canvas");
-    recordingCanvas.width = 2;
-    recordingCanvas.height = 2;
-    recordingCanvas.getContext("2d")?.fillRect(0, 0, 2, 2);
-    if (typeof recordingCanvas.captureStream !== "function") {
-      throw new Error("This browser cannot create a compatible recording.");
-    }
-    const videoStream = recordingCanvas.captureStream(1);
-    recordingStream = new MediaStream([
-      ...videoStream.getVideoTracks(),
-      ...recordingAudioStream.getAudioTracks(),
-    ]);
+    recordingStream = recordingAudioStream;
     recordedChunks = [];
     const mimeType = [
-      "video/webm;codecs=vp8,opus",
-      "video/webm;codecs=vp9,opus",
-      "video/webm",
-      "video/mp4;codecs=avc1,mp4a.40.2",
-      "video/mp4",
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/mp4;codecs=mp4a.40.2",
+      "audio/mp4",
     ].find((type) => MediaRecorder.isTypeSupported(type));
     const currentRecordingGeneration = ++recordingGeneration;
     const recorder = mimeType
@@ -351,7 +338,6 @@ async function startClipRecording() {
       recordingStream?.getTracks().forEach((track) => track.stop());
       recordingStream = null;
       recordingAudioStream = null;
-      recordingCanvas = null;
       recordButton.classList.remove("recording");
       recordingProgress.classList.add("hidden");
 
@@ -397,7 +383,6 @@ async function startClipRecording() {
     recordingAudioStream?.getTracks().forEach((track) => track.stop());
     recordingStream = null;
     recordingAudioStream = null;
-    recordingCanvas = null;
     recordButton.classList.remove("hidden");
     recordButton.disabled = false;
     recordButton.textContent = "Try recording again";
@@ -664,7 +649,7 @@ function renderState(state, gameState) {
     recordingUploadStatus.textContent = waitingForReconnect
       ? "Waiting for a disconnected player to rejoin..."
       : processingSounds
-        ? "Sit tight, uploading to Stream and finishing everyone's sounds..."
+        ? "Sit tight, saving everyone's sounds..."
         : "";
     const showFinalStart = state.recordingStage === "triumph" && currentPlayer?.isHost && everyoneSubmitted && !waitingForReconnect;
     recordingStartButton.classList.toggle("hidden", !showFinalStart);
@@ -689,7 +674,7 @@ function renderState(state, gameState) {
           ? currentPlayer?.isHost
             ? "All sounds are ready. Start the game when everyone is set."
             : "All sounds are ready. Waiting for the host to start the game."
-          : "Everyone is ready. Stream is finishing the sounds in the background...";
+          : "Everyone is ready. The sounds are still being saved...";
       } else {
         recordingCopy.textContent = "You're ready. You can now hear the other ready players.";
       }
