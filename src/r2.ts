@@ -13,7 +13,7 @@ export type ClipUploadResult =
 
 function extensionFor(contentType: string): string {
   if (contentType.includes("mp4")) {
-    return "m4a";
+    return "mp4";
   }
   if (contentType.includes("ogg")) {
     return "ogg";
