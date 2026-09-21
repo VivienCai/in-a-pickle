@@ -12,7 +12,7 @@ import {
   TICK_MS,
   WORLD_HEIGHT,
 } from "./gameRules";
-import { deleteClip, uploadClip } from "./r2";
+import { deleteClip, prepareClipAudio, uploadClip } from "./stream";
 import type {
   ClientMessage,
   LiveGameState,
@@ -25,8 +25,6 @@ import type {
 interface Env {
   GAME_ROOMS: DurableObjectNamespace;
   ASSETS: Fetcher;
-  AUDIO_BUCKET: R2Bucket;
-  R2_PUBLIC_URL: string;
   CLOUDFLARE_ACCOUNT_ID: string;
   REALTIMEKIT_APP_ID: string;
   REALTIMEKIT_PRESET_NAME: string;
@@ -62,6 +60,7 @@ interface MeetingRow {
 const RECONNECT_GRACE_MS = 5 * 60 * 1000;
 const RUN_SPEED = 145;
 const SPEAKING_VOLUME_THRESHOLD = 0.15;
+const PROCESSING_RETRY_MS = 70 * 1000;
 
 export class GameRoom extends DurableObject<Env> {
   private readonly sockets = new Map<WebSocket, string>();
@@ -391,9 +390,12 @@ export class GameRoom extends DurableObject<Env> {
       return Response.json({ error: "Sound recording is not open right now." }, { status: 409 });
     }
 
-    const uploaded = await uploadClip(this.env, clip, roomCode, playerId, stage);
+    const uploaded = await uploadClip(this.env, clip);
     if (!uploaded.ok) {
-      return Response.json({ error: `Could not upload that sound clip: ${uploaded.error}` }, { status: 502 });
+      const tokenHelp = /auth|permission/i.test(uploaded.error)
+        ? " Give the API token Account > Stream > Edit permission, then restart Wrangler."
+        : "";
+      return Response.json({ error: `Could not upload that sound clip: ${uploaded.error}${tokenHelp}` }, { status: 502 });
     }
 
     const currentRoom = this.ctx.storage.sql.exec(
@@ -405,7 +407,7 @@ export class GameRoom extends DurableObject<Env> {
       currentRoom[0]?.recording_stage !== stage ||
       !this.playerExists(roomCode, playerId)
     ) {
-      await deleteClip(this.env, uploaded.key);
+      await deleteClip(this.env, uploaded.uid);
       return Response.json({ error: "The recording round changed while that clip was uploading." }, { status: 409 });
     }
 
@@ -417,21 +419,71 @@ export class GameRoom extends DurableObject<Env> {
     const previousUid = existing[0]?.clip_uid;
     this.ctx.storage.sql.exec(
       `UPDATE players SET ${uidColumn} = ?, ${urlColumn} = ?, recording_ready = 1 WHERE id = ? AND room_code = ?`,
-      uploaded.key,
-      uploaded.url,
+      uploaded.uid,
+      null,
       playerId,
       roomCode,
     );
-    if (previousUid && previousUid !== uploaded.key) {
+    if (previousUid && previousUid !== uploaded.uid) {
       this.ctx.waitUntil(deleteClip(this.env, previousUid));
     }
 
+    this.ctx.waitUntil(this.preparePlayerClip(roomCode, playerId, stage, uploaded.uid));
     this.scheduleNextAlarm();
 
     this.broadcastState();
-    this.advanceRecordingIfReady();
 
     return Response.json({ ok: true });
+  }
+
+  private async preparePlayerClip(
+    roomCode: string,
+    playerId: string,
+    stage: "death" | "triumph",
+    uid: string,
+  ): Promise<void> {
+    const result = await prepareClipAudio(this.env, uid);
+    const uidColumn = stage === "death" ? "clip_uid" : "triumph_clip_uid";
+    const urlColumn = stage === "death" ? "clip_url" : "triumph_clip_url";
+    const current = this.ctx.storage.sql
+      .exec(`SELECT ${uidColumn} AS clip_uid FROM players WHERE id = ? AND room_code = ?`, playerId, roomCode)
+      .toArray() as unknown as Array<{ clip_uid: string | null }>;
+    if (current[0]?.clip_uid !== uid) {
+      await deleteClip(this.env, uid);
+      return;
+    }
+
+    if (!result.ok) {
+      if (result.retryable) {
+        this.scheduleNextAlarm(10_000);
+        return;
+      }
+      await deleteClip(this.env, uid);
+      this.ctx.storage.sql.exec(
+        `UPDATE players SET ${uidColumn} = NULL, ${urlColumn} = NULL, recording_ready = 0 WHERE id = ? AND room_code = ?`,
+        playerId,
+        roomCode,
+      );
+      for (const [socket, socketPlayerId] of this.sockets) {
+        if (socketPlayerId === playerId) {
+          this.send(socket, { type: "error", message: result.error });
+        }
+      }
+      this.broadcastState();
+      this.scheduleNextAlarm();
+      return;
+    }
+
+    this.ctx.storage.sql.exec(
+      `UPDATE players SET ${urlColumn} = ? WHERE id = ? AND room_code = ? AND ${uidColumn} = ?`,
+      result.audioUrl,
+      playerId,
+      roomCode,
+      uid,
+    );
+    this.broadcastState();
+    this.advanceRecordingIfReady();
+    this.scheduleNextAlarm();
   }
 
   private playerExists(roomCode: string, playerId: string): boolean {
@@ -475,8 +527,15 @@ export class GameRoom extends DurableObject<Env> {
     }
 
     this.reassignHostIfNeeded("");
+    const pending = this.pendingClips();
+    await Promise.all(pending.map((clip) => this.preparePlayerClip(
+      clip.roomCode,
+      clip.playerId,
+      clip.stage,
+      clip.uid,
+    )));
     this.advanceRecordingIfReady();
-    this.scheduleNextAlarm();
+    this.scheduleNextAlarm(10_000);
   }
 
   private ensurePlayerColumn(name: string, definition: string): void {
@@ -533,7 +592,34 @@ export class GameRoom extends DurableObject<Env> {
     };
   }
 
-  private scheduleNextAlarm(): void {
+  private pendingClips(): Array<{
+    roomCode: string;
+    playerId: string;
+    stage: "death" | "triumph";
+    uid: string;
+  }> {
+    const rows = this.ctx.storage.sql.exec(
+      `SELECT id, room_code, clip_uid, clip_url, triumph_clip_uid, triumph_clip_url
+       FROM players`,
+    ).toArray() as unknown as StoredPlayer[];
+    return rows.flatMap((player) => {
+      const pending: Array<{
+        roomCode: string;
+        playerId: string;
+        stage: "death" | "triumph";
+        uid: string;
+      }> = [];
+      if (player.clip_uid && !player.clip_url) {
+        pending.push({ roomCode: player.room_code, playerId: player.id, stage: "death", uid: player.clip_uid });
+      }
+      if (player.triumph_clip_uid && !player.triumph_clip_url) {
+        pending.push({ roomCode: player.room_code, playerId: player.id, stage: "triumph", uid: player.triumph_clip_uid });
+      }
+      return pending;
+    });
+  }
+
+  private scheduleNextAlarm(pendingDelayMs = PROCESSING_RETRY_MS): void {
     const deadlines: number[] = [];
     const disconnected = this.ctx.storage.sql.exec(
       "SELECT MIN(last_seen_at) AS last_seen_at FROM players WHERE connected = 0",
@@ -542,6 +628,10 @@ export class GameRoom extends DurableObject<Env> {
     if (lastSeenAt !== null && lastSeenAt !== undefined) {
       deadlines.push(lastSeenAt + RECONNECT_GRACE_MS);
     }
+    if (this.pendingClips().length > 0) {
+      deadlines.push(Date.now() + pendingDelayMs);
+    }
+
     if (deadlines.length > 0) {
       void this.ctx.storage.setAlarm(Math.max(Date.now() + 100, Math.min(...deadlines)));
     } else {

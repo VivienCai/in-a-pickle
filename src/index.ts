@@ -3,8 +3,6 @@ export { GameRoom } from "./gameRoom";
 export interface Env {
   GAME_ROOMS: DurableObjectNamespace;
   ASSETS: Fetcher;
-  AUDIO_BUCKET: R2Bucket;
-  R2_PUBLIC_URL: string;
   CLOUDFLARE_ACCOUNT_ID: string;
   REALTIMEKIT_APP_ID: string;
   REALTIMEKIT_PRESET_NAME: string;
