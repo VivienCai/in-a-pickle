@@ -25,7 +25,7 @@ function makeEnv() {
   };
 }
 
-test("uploadClip stores a playable recording with an immutable unique URL", async () => {
+test("uploadClip stores playable audio with an immutable unique URL", async () => {
   const { env, puts } = makeEnv();
   const clip = new Blob(["audio"], { type: "audio/webm;codecs=opus" });
 

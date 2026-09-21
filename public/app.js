@@ -62,7 +62,6 @@ let recordingVoiceMode = null;
 let mediaRecorder = null;
 let recordingStream = null;
 let recordingAudioStream = null;
-let recordingCanvas = null;
 let recordingTimer = null;
 let recordingStartedAt = 0;
 let recordedChunks = [];
@@ -70,7 +69,6 @@ let recordedClip = null;
 let previewUrl = null;
 let activeRecordingStage = null;
 let recordingGeneration = 0;
-let calibrationInProgress = false;
 
 function showStatus(message) {
   statusText.textContent = message;
@@ -222,7 +220,7 @@ function setRemoteAudioMuted(muted) {
 }
 
 async function syncRecordingVoice(state) {
-  const mode = state.status === "recording" || !calibration || calibrationInProgress
+  const mode = state.status === "recording"
     ? "isolated"
     : "open";
   if (!voiceMeeting || recordingVoiceMode === mode) {
@@ -244,7 +242,7 @@ async function syncRecordingVoice(state) {
 
     recordingVoiceMode = mode;
     if (mode === "isolated") {
-      setVoiceStatus(state.status === "recording" ? "recording privately" : "muted until calibrated");
+      setVoiceStatus("recording privately");
     } else {
       setVoiceStatus("connected");
     }
@@ -316,25 +314,13 @@ async function startClipRecording() {
     recordingAudioStream = gameplayTrack
       ? new MediaStream([gameplayTrack.clone()])
       : await navigator.mediaDevices.getUserMedia({ audio: true });
-    recordingCanvas = document.createElement("canvas");
-    recordingCanvas.width = 2;
-    recordingCanvas.height = 2;
-    recordingCanvas.getContext("2d")?.fillRect(0, 0, 2, 2);
-    if (typeof recordingCanvas.captureStream !== "function") {
-      throw new Error("This browser cannot create a compatible recording.");
-    }
-    const videoStream = recordingCanvas.captureStream(1);
-    recordingStream = new MediaStream([
-      ...videoStream.getVideoTracks(),
-      ...recordingAudioStream.getAudioTracks(),
-    ]);
+    recordingStream = recordingAudioStream;
     recordedChunks = [];
     const mimeType = [
-      "video/webm;codecs=vp8,opus",
-      "video/webm;codecs=vp9,opus",
-      "video/webm",
-      "video/mp4;codecs=avc1,mp4a.40.2",
-      "video/mp4",
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/mp4;codecs=mp4a.40.2",
+      "audio/mp4",
     ].find((type) => MediaRecorder.isTypeSupported(type));
     const currentRecordingGeneration = ++recordingGeneration;
     const recorder = mimeType
@@ -352,7 +338,6 @@ async function startClipRecording() {
       recordingStream?.getTracks().forEach((track) => track.stop());
       recordingStream = null;
       recordingAudioStream = null;
-      recordingCanvas = null;
       recordButton.classList.remove("recording");
       recordingProgress.classList.add("hidden");
 
@@ -398,7 +383,6 @@ async function startClipRecording() {
     recordingAudioStream?.getTracks().forEach((track) => track.stop());
     recordingStream = null;
     recordingAudioStream = null;
-    recordingCanvas = null;
     recordButton.classList.remove("hidden");
     recordButton.disabled = false;
     recordButton.textContent = "Try recording again";
@@ -572,12 +556,8 @@ async function calibrateMicrophone() {
   }
 
   calibration = null;
-  calibrationInProgress = true;
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ type: "micNotReady" }));
-  }
-  if (latestState) {
-    await syncRecordingVoice(latestState);
   }
   calibrateButton.disabled = true;
   calibrationInstructions.textContent = "Stay quiet for a moment...";
@@ -590,7 +570,6 @@ async function calibrateMicrophone() {
   const noiseFloor = percentile(quietSamples, 0.8);
   const loudLevel = percentile(loudSamples, 0.9);
   if (loudLevel - noiseFloor < 0.03) {
-    calibrationInProgress = false;
     calibrateButton.disabled = false;
     calibrationInstructions.textContent = "That was too quiet. Try again and make more noise.";
     showStatus("");
@@ -598,7 +577,6 @@ async function calibrateMicrophone() {
   }
 
   calibration = { noiseFloor, loudLevel };
-  calibrationInProgress = false;
   calibrateButton.textContent = "Recalibrate Microphone";
   calibrationInstructions.textContent = "Calibrated. You can recalibrate later if your setup changes.";
   micStatus.textContent = "Microphone calibrated";
@@ -607,9 +585,6 @@ async function calibrateMicrophone() {
   showStatus("");
   if (socket && socket.readyState === WebSocket.OPEN) {
     socket.send(JSON.stringify({ type: "micReady" }));
-  }
-  if (latestState) {
-    await syncRecordingVoice(latestState);
   }
 }
 
