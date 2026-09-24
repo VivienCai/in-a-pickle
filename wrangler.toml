@@ -7,10 +7,16 @@ compatibility_date = "2025-05-01"
 CLOUDFLARE_ACCOUNT_ID = "0f8e8a0bcbe9713b1227d70488e1a9d8"
 REALTIMEKIT_APP_ID = "96ae0a35-db30-4104-b896-2973b8fd7594"
 REALTIMEKIT_PRESET_NAME = "audio_only_participant"
+R2_PUBLIC_URL = "https://pub-1fb4746495c1403190642effe601ba8c.r2.dev"
 
 [assets]
 directory = "./public"
 binding = "ASSETS"
+
+[[r2_buckets]]
+binding = "AUDIO_BUCKET"
+bucket_name = "in-a-pickle-audio"
+remote = true
 
 [[durable_objects.bindings]]
 name = "GAME_ROOMS"

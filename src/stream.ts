@@ -1,10 +1,8 @@
 export interface StreamConfig {
+  AUDIO_BUCKET: R2Bucket;
+  R2_PUBLIC_URL: string;
   CLOUDFLARE_ACCOUNT_ID: string;
   CLOUDFLARE_API_TOKEN: string;
-}
-
-interface StreamUploadResponse {
-  result?: { uid?: string };
 }
 
 interface StreamDownloadResponse {
@@ -30,10 +28,18 @@ export type StreamAudioResult =
   | { ok: true; audioUrl: string }
   | { ok: false; error: string; retryable: boolean };
 
-function isConfigured(env: StreamConfig): boolean {
+function isLegacyStreamConfigured(env: StreamConfig): boolean {
   return [env.CLOUDFLARE_ACCOUNT_ID, env.CLOUDFLARE_API_TOKEN].every(
     (value) => typeof value === "string" && value.length > 0 && !value.startsWith("TODO"),
   );
+}
+
+function isR2Key(uid: string): boolean {
+  return uid.startsWith("clips/");
+}
+
+function extensionFor(contentType: string): string {
+  return contentType.includes("mp4") ? "mp4" : "webm";
 }
 
 function baseUrl(env: StreamConfig): string {
@@ -53,37 +59,24 @@ export async function uploadClip(
   env: StreamConfig,
   clip: Blob,
 ): Promise<StreamUploadResult> {
-  if (!isConfigured(env)) {
-    return { ok: false, error: "Cloudflare Stream is not configured." };
+  const publicUrl = env.R2_PUBLIC_URL?.replace(/\/$/, "");
+  if (!env.AUDIO_BUCKET || !publicUrl) {
+    return { ok: false, error: "R2 audio storage is not configured." };
   }
 
+  const contentType = clip.type || "video/webm";
+  const uid = `clips/${crypto.randomUUID()}.${extensionFor(contentType)}`;
   try {
-    const formData = new FormData();
-    const extension = clip.type.includes("mp4") ? "mp4" : "webm";
-    const fileName = clip instanceof File ? clip.name : `sound-effect.${extension}`;
-    formData.append("file", clip, fileName);
-
-    const uploadResponse = await fetch(baseUrl(env), {
-      method: "POST",
-      headers: authHeaders(env),
-      body: formData,
+    await env.AUDIO_BUCKET.put(uid, clip, {
+      httpMetadata: {
+        contentType,
+        cacheControl: "public, max-age=300, immutable",
+      },
     });
-    if (!uploadResponse.ok) {
-      const error = await responseError(uploadResponse, `Stream upload failed (${uploadResponse.status}).`);
-      console.error(`Stream clip upload failed: ${error}`);
-      return { ok: false, error };
-    }
-
-    const upload = await uploadResponse.json() as StreamUploadResponse;
-    const uid = upload.result?.uid;
-    if (!uid) {
-      return { ok: false, error: "Stream did not return an upload ID." };
-    }
-
     return { ok: true, uid };
   } catch (error) {
-    console.error("Stream clip upload error:", error);
-    return { ok: false, error: "Could not reach Cloudflare Stream." };
+    console.error("R2 clip upload error:", error);
+    return { ok: false, error: "Could not save the sound recording." };
   }
 }
 
@@ -91,6 +84,17 @@ export async function prepareClipAudio(
   env: StreamConfig,
   uid: string,
 ): Promise<StreamAudioResult> {
+  if (isR2Key(uid)) {
+    const publicUrl = env.R2_PUBLIC_URL?.replace(/\/$/, "");
+    return publicUrl
+      ? { ok: true, audioUrl: `${publicUrl}/${uid}` }
+      : { ok: false, error: "R2 audio storage is not configured.", retryable: false };
+  }
+
+  if (!isLegacyStreamConfigured(env)) {
+    return { ok: false, error: "Cloudflare Stream is not configured.", retryable: false };
+  }
+
   try {
 
     let videoReady = false;
@@ -164,7 +168,24 @@ export async function prepareClipAudio(
 }
 
 export async function deleteClip(env: StreamConfig, uid: string): Promise<boolean> {
-  if (!isConfigured(env) || !uid) {
+  if (!uid) {
+    return false;
+  }
+
+  if (isR2Key(uid)) {
+    if (!env.AUDIO_BUCKET) {
+      return false;
+    }
+    try {
+      await env.AUDIO_BUCKET.delete(uid);
+      return true;
+    } catch (error) {
+      console.error("R2 clip deletion error:", error);
+      return false;
+    }
+  }
+
+  if (!isLegacyStreamConfigured(env)) {
     return false;
   }
 
